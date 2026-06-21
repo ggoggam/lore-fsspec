@@ -1,0 +1,253 @@
+"""Integration tests against a live Lore server (gated by `fixture_repo`)."""
+
+from __future__ import annotations
+
+import os
+
+import fsspec
+import pytest
+
+from lore_fsspec import LoreFileSystem
+
+# Every test in this module needs a live Lore server (via `fixture_repo`). The
+# marker lets `pytest -m 'not integration'` (mise run test:unit) skip them
+# deterministically, independent of whether a server happens to be reachable.
+pytestmark = pytest.mark.integration
+
+
+@pytest.fixture
+def fs(fixture_repo):
+    # cachable=True would memoize instances across tests; force a fresh one.
+    return LoreFileSystem(path=fixture_repo["root"], skip_instance_cache=True)
+
+
+def _revision_count(fs) -> int:
+    """Number of committed revisions (the user-visible commit guarantee)."""
+    import fsspec.asyn
+    from lore.types.args import LoreRevisionHistoryArgs
+    from lore.types.events import LoreRevisionHistoryEntryEventData
+
+    evs = fsspec.asyn.sync(
+        fs.loop,
+        fs._run,
+        fs._lore.revision_history,
+        LoreRevisionHistoryArgs(),
+        entry_type=LoreRevisionHistoryEntryEventData,
+    )
+    return len(evs)
+
+
+def test_default_ref_is_current_branch(fs):
+    assert fs.ref == "main"
+
+
+def test_ls_root(fs):
+    assert set(fs.ls("", detail=False)) >= {"hello.txt", "sub", "Content"}
+
+
+def test_ls_detail_shape(fs):
+    entries = {e["name"]: e for e in fs.ls("", detail=True)}
+    assert entries["hello.txt"]["type"] == "file"
+    assert entries["hello.txt"]["size"] == 51
+    assert entries["sub"]["type"] == "directory"
+
+
+def test_ls_nested_returns_full_repo_relative_names(fs):
+    assert fs.ls("Content/Config", detail=False) == ["Content/Config/Game.ini"]
+    assert fs.ls("Content", detail=False) == ["Content/Config"]
+
+
+def test_find_recurses(fs):
+    found = set(fs.find(""))
+    assert {"hello.txt", "sub/data.bin", "Content/Config/Game.ini"} <= found
+
+
+def test_info_file(fs):
+    info = fs.info("hello.txt")
+    assert info["type"] == "file"
+    assert info["size"] == 51
+    assert len(info["hash"]) == 64  # 32-byte content hash, hex
+
+
+def test_info_missing_raises(fs):
+    with pytest.raises(FileNotFoundError):
+        fs.info("does/not/exist.txt")
+
+
+def test_cat_file_full(fs, fixture_repo):
+    assert fs.cat("hello.txt") == fixture_repo["files"]["hello.txt"]
+
+
+def test_cat_file_range(fs):
+    assert fs.cat_file("hello.txt", start=6, end=11) == b"lore "
+
+
+def test_open_read(fs, fixture_repo):
+    with fs.open("hello.txt") as f:
+        assert f.read() == fixture_repo["files"]["hello.txt"]
+
+
+def test_cat_file_from_store_when_not_on_disk(fs, fixture_repo):
+    """In-store read path: bytes come from `storage_get`, not the working copy."""
+    os.remove(os.path.join(fixture_repo["root"], "hello.txt"))
+    # file_info still resolves the committed content; local_size drops to 0.
+    assert fs.info("hello.txt")["local_size"] == 0
+    assert fs.cat("hello.txt") == fixture_repo["files"]["hello.txt"]
+
+
+def test_cat_file_range_from_store(fs, fixture_repo):
+    os.remove(os.path.join(fixture_repo["root"], "hello.txt"))
+    assert fs.cat_file("hello.txt", start=6, end=11) == b"lore "
+
+
+def test_close_releases_store_handle(fs, fixture_repo):
+    os.remove(os.path.join(fixture_repo["root"], "hello.txt"))
+    fs.cat("hello.txt")  # opens the store handle
+    assert fs._store_handle is not None
+    fs.close()
+    assert fs._store_handle is None
+
+
+def test_context_manager_closes(fixture_repo):
+    with LoreFileSystem(path=fixture_repo["root"], skip_instance_cache=True) as fs:
+        os.remove(os.path.join(fixture_repo["root"], "hello.txt"))
+        assert fs.cat("hello.txt") == fixture_repo["files"]["hello.txt"]
+        assert fs._store_handle is not None
+    assert fs._store_handle is None
+
+
+def _revision_hexes(fs) -> list[str]:
+    """Committed revisions newest-first, as hex ids usable in a ``ref=`` arg."""
+    import fsspec.asyn
+    from lore.types.args import LoreRevisionHistoryArgs
+    from lore.types.events import LoreRevisionHistoryEntryEventData
+
+    evs = fsspec.asyn.sync(
+        fs.loop,
+        fs._run,
+        fs._lore.revision_history,
+        LoreRevisionHistoryArgs(),
+        entry_type=LoreRevisionHistoryEntryEventData,
+    )
+    return [e.revision.hex() for e in evs]
+
+
+def test_resolve_rev_defaults_and_passthrough(fs):
+    import fsspec.asyn
+
+    # empty / current branch -> "" (working copy, no resolution roundtrip)
+    assert fsspec.asyn.sync(fs.loop, fs._resolve_rev, None) == ""
+    assert fsspec.asyn.sync(fs.loop, fs._resolve_rev, "main") == ""
+    # an unknown ref (not a branch) passes through as a revision id
+    assert fsspec.asyn.sync(fs.loop, fs._resolve_rev, "abc123") == "abc123"
+
+
+def test_resolve_branch_name_to_tip(fs):
+    import fsspec.asyn
+    from lore.types.args import LoreBranchCreateArgs
+
+    fsspec.asyn.sync(
+        fs.loop,
+        fs._run,
+        fs._lore.branch_create,
+        LoreBranchCreateArgs(branch="feature"),
+    )
+    tip = fsspec.asyn.sync(fs.loop, fs._resolve_rev, "feature")
+    # branch name resolves to a 32-byte revision id (hex), not passed through raw
+    assert tip and tip != "feature" and len(tip) == 64
+
+
+def test_cat_at_revision_id(fs, fixture_repo):
+    """Reading an explicit (non-checked-out) revision goes through the store."""
+    orig = fixture_repo["files"]["hello.txt"]
+    with fs.transaction(message="rev2"):
+        fs.pipe_file("hello.txt", b"second revision\n")
+    assert fs.cat("hello.txt") == b"second revision\n"  # working copy is rev2
+    rev1 = _revision_hexes(fs)[-1]  # oldest revision == the fixture commit
+    assert fs.cat("hello.txt", ref=rev1) == orig
+
+
+def test_open_async_full_read(fs, fixture_repo):
+    import fsspec.asyn
+
+    f = fsspec.asyn.sync(fs.loop, fs.open_async, "hello.txt")
+    try:
+        data = fsspec.asyn.sync(fs.loop, f.read)
+    finally:
+        fsspec.asyn.sync(fs.loop, f.close)
+    assert data == fixture_repo["files"]["hello.txt"]
+
+
+def test_open_async_seek_and_chunked_read(fs, fixture_repo):
+    import fsspec.asyn
+
+    full = fixture_repo["files"]["hello.txt"]
+    f = fsspec.asyn.sync(fs.loop, fs.open_async, "hello.txt")
+    try:
+        first = fsspec.asyn.sync(fs.loop, f.read, 6)
+        f.seek(6)
+        mid = fsspec.asyn.sync(fs.loop, f.read, 5)
+    finally:
+        fsspec.asyn.sync(fs.loop, f.close)
+    assert first == full[:6]
+    assert mid == b"lore "
+
+
+def test_fetch_syncs_current_ref(fs):
+    targets = fs.fetch()
+    assert targets and all(isinstance(t, int) for t in targets)
+    # naming the default branch resolves to the same tip, no error
+    assert fs.fetch("main")
+
+
+def test_concurrent_cat_fanout_shares_one_handle(fs, fixture_repo):
+    """`_cat` fan-out over the store path must not race-open multiple handles."""
+    rels = ["hello.txt", "sub/data.bin", "Content/Config/Game.ini"]
+    for rel in rels:
+        os.remove(os.path.join(fixture_repo["root"], rel))
+    out = fs.cat(rels)  # concurrent _cat_file gather, all via storage_get
+    for rel in rels:
+        assert out[rel] == fixture_repo["files"][rel]
+    assert isinstance(fs._store_handle, int)
+
+
+def test_cat_ranges_random_access_from_store(fs, fixture_repo):
+    """Random-access ranged reads (the pyarrow/zarr pattern) over the store."""
+    os.remove(os.path.join(fixture_repo["root"], "hello.txt"))
+    full = fixture_repo["files"]["hello.txt"]
+    assert fs.cat_file("hello.txt", start=0, end=5) == full[0:5]
+    assert fs.cat_file("hello.txt", start=10, end=20) == full[10:20]
+    assert fs.cat_file("hello.txt", start=40) == full[40:]
+    res = fs.cat_ranges(["hello.txt", "hello.txt"], [0, 17], [5, 34])
+    assert res == [full[0:5], full[17:34]]
+
+
+def test_ukey_is_content_hash(fs):
+    assert fs.ukey("hello.txt") == fs.info("hello.txt")["hash"]
+
+
+def test_url_roundtrip(fixture_repo):
+    url = f"lore://{fixture_repo['root']}:main@hello.txt"
+    with fsspec.open(url) as f:
+        assert f.read() == fixture_repo["files"]["hello.txt"]
+
+
+def test_transaction_commit_roundtrip(fs):
+    before = _revision_count(fs)
+    with fs.transaction(message="add via fsspec"):
+        fs.pipe_file("new/dir/a.txt", b"alpha")
+        fs.pipe_file("b.txt", b"beta")
+    assert fs.cat("new/dir/a.txt") == b"alpha"
+    assert fs.cat("b.txt") == b"beta"
+    # One revision for the whole transaction, regardless of file count.
+    assert _revision_count(fs) == before + 1
+
+
+def test_transaction_rollback_does_not_commit(fs):
+    before = _revision_count(fs)
+    with pytest.raises(RuntimeError):
+        with fs.transaction(message="should not land"):
+            fs.pipe_file("ghost.txt", b"boo")
+            raise RuntimeError("boom")
+    # Rollback unstages the write; no new revision is committed.
+    assert _revision_count(fs) == before

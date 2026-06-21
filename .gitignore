@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# venv / tooling
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Downloaded loreserver binary (see scripts/with-loreserver.sh)
+.cache/

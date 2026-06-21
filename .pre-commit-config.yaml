@@ -1,0 +1,28 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+      - id: debug-statements
+
+  - repo: local
+    hooks:
+      - id: ruff-format-check
+        name: ruff format check
+        entry: mise run fmt:check
+        language: system
+        pass_filenames: false
+        types_or: [python, pyi]
+
+      - id: ruff-lint
+        name: ruff lint
+        entry: mise run lint
+        language: system
+        pass_filenames: false
+        types_or: [python, pyi]
