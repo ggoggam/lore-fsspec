@@ -81,12 +81,12 @@ else
   healthy || { echo "loreserver did not become healthy at ${HEALTH_URL}" >&2; cat "${TMPDIR:-/tmp}/loreserver.log" >&2; exit 1; }
 fi
 
-uv run pytest
+uv run --dev pytest
 """
 
 [tasks."test:unit"]
 description = "Run unit tests only (no Lore server; fast local loop)"
-run = "uv run pytest -m 'not integration'"
+run = "uv run --dev pytest -m 'not integration'"
 
 [tasks."pre-commit"]
 description = "Run pre-commit checks via prek"
