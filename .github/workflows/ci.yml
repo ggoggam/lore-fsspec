@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pre-commit:
+    name: pre-commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs the tools pinned in mise.toml ([tools]: uv, ruff, prek) and caches
+      # the mise data dir keyed on mise.toml / mise.lock.
+      - uses: jdx/mise-action@v3
+
+      # Cache prek's hook environments and uv's download cache across runs.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/prek
+            ~/.cache/uv
+            .venv
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml', 'uv.lock') }}
+          restore-keys: |
+            pre-commit-${{ runner.os }}-
+
+      - name: Run pre-commit checks
+        run: mise run pre-commit
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v3
+
+      # Cache the uv download cache, the resolved virtualenv, and the downloaded
+      # loreserver binary (see the `test` task in mise.toml).
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+            .cache/loreserver
+          key: test-${{ runner.os }}-${{ hashFiles('uv.lock') }}-lore${{ hashFiles('mise.toml') }}
+          restore-keys: |
+            test-${{ runner.os }}-
+
+      - name: Test
+        run: mise run test
+
+  ci-required:
+    name: ci-required
+    needs:
+      - pre-commit
+      - test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check required jobs
+        env:
+          PRE_COMMIT_RESULT: ${{ needs.pre-commit.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          set -euo pipefail
+          for result in "$PRE_COMMIT_RESULT" "$TEST_RESULT"; do
+            if [ "$result" != "success" ]; then
+              echo "A required CI job did not pass."
+              exit 1
+            fi
+          done
+          echo "All required CI jobs passed."
