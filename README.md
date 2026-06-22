@@ -44,6 +44,24 @@ with fs.transaction(message="Import baked lighting"):
     fs.pipe_file("Content/Config/Game.ini", ini_bytes)
 ```
 
+Branch topology is exposed as explicit methods (not folded into the write
+transaction), mirroring `fetch()`. A transaction can target a branch so the
+revision lands there in isolation; merging back is a separate, explicit step
+because it can conflict:
+
+```python
+fs.branches()                                  # ['main']
+fs.create_branch("import-job", checkout=True)  # like `git switch -c`
+
+# Commit onto a branch in isolation, then restore the original branch on exit.
+with fs.transaction(message="Import", branch="import-job", create=True):
+    fs.pipe_file("Content/Lighting/Baked.bin", data)
+
+# Clean merges land as one revision; a conflicting merge is aborted and raises
+# with the conflicting paths (auto-resolution is intentionally never performed).
+fs.merge("import-job")
+```
+
 ## Documentation
 
 - [`docs/01-overview.md`](docs/01-overview.md) — what Lore is, the `lore` Python

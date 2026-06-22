@@ -318,3 +318,70 @@ def test_transaction_rollback_does_not_commit(fs):
             raise RuntimeError("boom")
     # Rollback unstages the write; no new revision is committed.
     assert _revision_count(fs) == before
+
+
+# ----------------------------------------------------------------- branches
+def test_branches_lists_and_creates(fs):
+    assert fs.branches() == ["main"]
+    fs.create_branch("feature")
+    assert set(fs.branches()) == {"main", "feature"}
+    # Creating a branch alone doesn't move us off the current branch.
+    assert fs.ref == "main"
+
+
+def test_create_branch_checkout_switches_ref(fs):
+    fs.create_branch("work", checkout=True)
+    assert fs.ref == "work"
+    fs.switch_branch("main")
+    assert fs.ref == "main"
+
+
+def test_branch_ops_require_writable(fixture_repo):
+    ro = LoreFileSystem(path=fixture_repo["root"], skip_instance_cache=True)
+    with pytest.raises(PermissionError):
+        ro.create_branch("nope")
+    with pytest.raises(PermissionError):
+        ro.merge("main")
+
+
+def test_transaction_branch_commits_on_target_and_restores(fs):
+    """Writes in a `branch=`/`create=` block land on that branch, not main."""
+    main_before = _revision_count(fs)
+    with fs.transaction(message="on feature", branch="feature", create=True):
+        fs.pipe_file("feature_only.txt", b"feat\n")
+    # Back on main when the block exits, and main is untouched.
+    assert fs.ref == "main"
+    assert _revision_count(fs) == main_before
+    assert not fs.exists("feature_only.txt")
+    # The file is present on the feature branch we committed to.
+    assert fs.cat("feature_only.txt", ref="feature") == b"feat\n"
+
+
+def test_clean_merge_brings_in_branch_changes(fs):
+    fs.create_branch("feature", checkout=True)
+    with fs.transaction(message="add on feature"):
+        fs.pipe_file("from_feature.txt", b"hi\n")
+    fs.switch_branch("main")
+    assert not fs.exists("from_feature.txt")
+    fs.merge("feature")
+    # Merge is a no-op-free fast path: the file now exists on main.
+    assert fs.cat("from_feature.txt") == b"hi\n"
+
+
+def test_conflicting_merge_aborts_and_raises(fs):
+    from lore_fsspec.errors import LoreError
+
+    # Divergent edits to the same path on main and feature.
+    fs.create_branch("feature", checkout=True)
+    with fs.transaction(message="feature edit"):
+        fs.pipe_file("hello.txt", b"feature side\n")
+    fs.switch_branch("main")
+    with fs.transaction(message="main edit"):
+        fs.pipe_file("hello.txt", b"main side\n")
+
+    main_before = _revision_count(fs)
+    with pytest.raises(LoreError, match="conflict"):
+        fs.merge("feature")
+    # Aborted: main's revision count is unchanged and its content is intact.
+    assert _revision_count(fs) == main_before
+    assert fs.cat("hello.txt") == b"main side\n"

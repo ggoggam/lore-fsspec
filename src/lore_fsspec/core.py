@@ -31,8 +31,12 @@ from fsspec.implementations.memory import MemoryFile
 import lore
 from lore.types import LoreAddress
 from lore.types.args import (
+    LoreBranchCreateArgs,
     LoreBranchListArgs,
+    LoreBranchMergeAbortArgs,
+    LoreBranchMergeStartArgs,
     LoreBranchPushArgs,
+    LoreBranchSwitchArgs,
     LoreFileInfoArgs,
     LoreFileResetArgs,
     LoreFileStageArgs,
@@ -52,6 +56,7 @@ from lore.types.args import (
 from lore.types.enums import LoreErrorCode
 from lore.types.events import (
     LoreBranchListEntryEventData,
+    LoreBranchMergeConflictFileEventData,
     LoreFileInfoEventData,
     LoreRepositoryDataEventData,
     LoreRepositoryStateDumpNodeEventData,
@@ -469,19 +474,28 @@ class LoreFileSystem(AsyncFileSystem):
         return LoreAsyncStreamedFile(self, path, info["size"], ref)
 
     # ----------------------------------------------------------------- writes
-    def _require_write(self) -> None:
-        """Guard every mutation: read-only unless ``writable`` + an open txn.
+    def _require_writable(self) -> None:
+        """Guard repo mutations that are atomic on their own (branch/merge).
 
-        Lore's write model is *stage → commit a revision*; a stage with no commit
-        leaves the working copy in a half-applied state. We therefore require an
-        open :class:`LoreTransaction` so the batch always lands as exactly one
-        atomic revision (see ``LoreTransaction.complete``).
+        Read-only unless ``writable``. Unlike file writes these don't need an open
+        transaction: ``create_branch``/``merge`` are each a single self-contained
+        Lore operation, not a batch staged across several calls.
         """
         if not self.writable:
             raise PermissionError(
                 "LoreFileSystem is read-only; construct it with writable=True to "
                 "enable writes"
             )
+
+    def _require_write(self) -> None:
+        """Guard every file write: read-only unless ``writable`` + an open txn.
+
+        Lore's write model is *stage → commit a revision*; a stage with no commit
+        leaves the working copy in a half-applied state. We therefore require an
+        open :class:`LoreTransaction` so the batch always lands as exactly one
+        atomic revision (see ``LoreTransaction.complete``).
+        """
+        self._require_writable()
         if not getattr(self, "_intrans", False):
             raise ValueError(
                 "writes must occur inside a transaction so they commit as one "
@@ -621,6 +635,81 @@ class LoreFileSystem(AsyncFileSystem):
             entry_type=LoreRevisionSyncTargetEventData,
         )
         return [t.target_revision_number for t in targets]
+
+    # --------------------------------------------------------------- branches
+    def branches(self) -> list[str]:
+        """Names of the clone's branches (de-duplicated, sorted).
+
+        ``branch_list`` can report a branch twice (local + remote tracking); we
+        collapse those, since callers want the set of branch names.
+        """
+        entries = fsspec.asyn.sync(
+            self.loop,
+            self._run,
+            self._lore.branch_list,
+            LoreBranchListArgs(),
+            entry_type=LoreBranchListEntryEventData,
+        )
+        return sorted({e.name for e in entries})
+
+    def create_branch(self, name: str, checkout: bool = False) -> None:
+        """Create a branch at the current branch tip (like ``git branch``).
+
+        Repo topology is deliberately *not* a transaction concern (transactions
+        batch file writes into one revision); branching is its own atomic op,
+        exposed as a method like :meth:`fetch`. With ``checkout=True`` the new
+        branch is also switched to, so subsequent writes/commits land on it.
+        """
+        self._require_writable()
+        fsspec.asyn.sync(self.loop, self._create_branch, name, checkout)
+
+    async def _create_branch(self, name: str, checkout: bool) -> None:
+        await self._run(self._lore.branch_create, LoreBranchCreateArgs(branch=name))
+        if checkout:
+            await self._run(self._lore.branch_switch, LoreBranchSwitchArgs(branch=name))
+            self.ref = name
+
+    def switch_branch(self, name: str) -> None:
+        """Check out branch ``name`` (updates the working copy and the fs's ref)."""
+        self._require_writable()
+        fsspec.asyn.sync(self.loop, self._switch_branch, name)
+
+    async def _switch_branch(self, name: str) -> None:
+        await self._run(self._lore.branch_switch, LoreBranchSwitchArgs(branch=name))
+        self.ref = name
+
+    def merge(self, source: str, message: str | None = None) -> None:
+        """Merge branch ``source`` into the current branch as one revision.
+
+        A clean merge is committed (and pushed when online) atomically — Lore's
+        ``branch_merge_start`` performs the merge commit itself. A merge with
+        conflicts is **aborted and raised** with the conflicting paths: we never
+        auto-resolve, because Lore merge resolution is an explicit, stateful flow
+        (start → resolve(-mine/-theirs) → commit) that has no safe default. Use
+        the ``lore`` CLI to resolve, then re-run.
+        """
+        self._require_writable()
+        fsspec.asyn.sync(self.loop, self._merge, source, message)
+
+    async def _merge(self, source: str, message: str | None) -> None:
+        msg = message or f"Merge {source} into {self.ref}"
+        evs = await self._run(
+            self._lore.branch_merge_start,
+            LoreBranchMergeStartArgs(branch=source, message=msg),
+        )
+        conflicts = [
+            e.path for e in evs if isinstance(e, LoreBranchMergeConflictFileEventData)
+        ]
+        if conflicts:
+            await self._run(self._lore.branch_merge_abort, LoreBranchMergeAbortArgs())
+            raise LoreError(
+                None,
+                f"merge of {source!r} into {self.ref!r} has conflicts in "
+                f"{conflicts}; resolve with the lore CLI and re-run (auto-merge "
+                f"is intentionally not performed)",
+            )
+        if not self.offline:
+            await self._run(self._lore.branch_push, LoreBranchPushArgs())
 
     # ------------------------------------------------------------- lifecycle
     def close(self) -> None:
