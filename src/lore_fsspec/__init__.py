@@ -16,4 +16,4 @@ from .transaction import LoreTransaction
 
 register_implementation("lore", LoreFileSystem, clobber=True)
 
-__all__ = ["LoreFileSystem", "LoreTransaction", "LoreError"]
+__all__ = ["LoreError", "LoreFileSystem", "LoreTransaction"]

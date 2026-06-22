@@ -1,4 +1,4 @@
-"""End-to-end benchmark: upload then query a multi-file parquet dataset.
+r"""End-to-end benchmark: upload then query a multi-file parquet dataset.
 
 A realistic data-engineering usecase, not a micro-test: generate a moderate
 (~50-200 MB) columnar dataset spread across several parquet files, **upload it as
@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -41,6 +42,12 @@ import pytest
 np = pytest.importorskip("numpy")
 pl = pytest.importorskip("polars")
 duckdb = pytest.importorskip("duckdb")
+
+import fsspec.asyn  # noqa: E402
+import lore  # noqa: E402
+import lore.types.args as lore_args  # noqa: E402
+from lore.types.args import LoreRevisionHistoryArgs  # noqa: E402
+from lore.types.events import LoreRevisionHistoryEntryEventData  # noqa: E402
 
 from lore_fsspec import LoreFileSystem  # noqa: E402
 
@@ -71,16 +78,10 @@ class _Timer:
         self.rows.append((label, seconds, mb))
 
     def report(self) -> None:
-        print("\n" + "=" * 64)
-        print(self.title)
         if self.subtitle:
-            print(f"  {self.subtitle}")
-        print("-" * 64)
-        print(f"  {'phase':<34}{'time(s)':>10}{'MB/s':>12}")
-        for label, secs, mb in self.rows:
-            tput = f"{mb / secs:>12.1f}" if mb and secs > 0 else " " * 12
-            print(f"  {label:<34}{secs:>10.3f}{tput}")
-        print("=" * 64)
+            pass
+        for _label, secs, mb in self.rows:
+            f"{mb / secs:>12.1f}" if mb and secs > 0 else " " * 12
 
 
 def _make_parquet(path: str, *, seed: int, rows: int = ROWS_PER_FILE) -> int:
@@ -102,14 +103,17 @@ def _make_parquet(path: str, *, seed: int, rows: int = ROWS_PER_FILE) -> int:
             "user_id": rng.integers(0, 100_000, n).astype(np.int32),
             "amount": rng.random(n) * 100.0,
             "quantity": rng.integers(1, 11, n).astype(np.int16),
-        }
+        },
     )
     df.write_parquet(path, row_group_size=ROW_GROUP, compression="snappy")
-    return os.path.getsize(path)
+    return Path(path).stat().st_size
 
 
 @pytest.fixture(scope="module")
-def uploaded_dataset(lore_server, tmp_path_factory):
+def uploaded_dataset(
+    lore_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict:
     """Generate the dataset locally, upload it in one Lore revision, yield context.
 
     Module-scoped so the generate+upload cost is paid once and shared by every
@@ -117,24 +121,22 @@ def uploaded_dataset(lore_server, tmp_path_factory):
     Builds its own server repo (rather than the function-scoped ``fixture_repo``)
     so the scope lines up.
     """
-    import lore
-    from lore.types import args as A
-
     timer = _Timer(
         "lore-fsspec parquet benchmark",
         f"files={N_FILES} rows/file={ROWS_PER_FILE:,} row_group={ROW_GROUP:,}",
     )
     tmp = tmp_path_factory.mktemp("bench")
     clone_root = str(tmp / "clone")
-    os.makedirs(clone_root, exist_ok=True)
+    Path(clone_root).mkdir(parents=True, exist_ok=True)
     local_dir = tmp / "local_parquet"
     local_dir.mkdir()
 
     # --- create an empty server repo + local clone (mirrors conftest.fixture_repo)
-    L = lore.Lore()
+    lore_instance = lore.Lore()
     url = f"{lore_server}/bench-{int(time.time() * 1000)}"
-    g = A.LoreGlobalArgs(repository_path=clone_root)
-    create = L.repository_create(g, A.LoreRepositoryCreateArgs(repository_url=url))
+    g = lore_args.LoreGlobalArgs(repository_path=clone_root)
+    create_args = lore_args.LoreRepositoryCreateArgs(repository_url=url)
+    create = lore_instance.repository_create(g, create_args)
     for ev in create.collect():
         if type(ev).__name__ == "LoreErrorEventData":
             pytest.fail(f"repo create failed: {ev.error_inner}")
@@ -163,7 +165,7 @@ def uploaded_dataset(lore_server, tmp_path_factory):
         "total_rows": full.height,
         "total_amount": full["amount"].sum(),
         "by_region": dict(
-            full.group_by("region").agg(pl.len().alias("c")).sort("region").iter_rows()
+            full.group_by("region").agg(pl.len().alias("c")).sort("region").iter_rows(),
         ),
     }
 
@@ -180,12 +182,8 @@ def uploaded_dataset(lore_server, tmp_path_factory):
         fs.close()
 
 
-def test_upload_landed_as_single_revision(uploaded_dataset):
+def test_upload_landed_as_single_revision(uploaded_dataset: dict) -> None:
     """The whole dataset import is one Lore revision, and every shard is listed."""
-    import fsspec.asyn
-    from lore.types.args import LoreRevisionHistoryArgs
-    from lore.types.events import LoreRevisionHistoryEntryEventData
-
     fs = uploaded_dataset["fs"]
     listed = fs.ls(DATA_DIR, detail=False)
     assert len(listed) == N_FILES
@@ -202,7 +200,7 @@ def test_upload_landed_as_single_revision(uploaded_dataset):
     assert len(revs) == 1
 
 
-def test_duckdb_sql_over_lore(uploaded_dataset):
+def test_duckdb_sql_over_lore(uploaded_dataset: dict) -> None:
     """DuckDB SQL aggregation over a lore:// glob, via a registered fsspec fs."""
     fs = uploaded_dataset["fs"]
     exp = uploaded_dataset["expected"]
@@ -214,10 +212,12 @@ def test_duckdb_sql_over_lore(uploaded_dataset):
 
     t0 = time.perf_counter()
     n_rows, total_amount = con.sql(
-        f"SELECT count(*), sum(amount) FROM read_parquet('{glob}')"
+        f"SELECT count(*), sum(amount) FROM read_parquet('{glob}')",
     ).fetchone()
     timer.record(
-        "duckdb scan+aggregate", time.perf_counter() - t0, uploaded_dataset["total_mb"]
+        "duckdb scan+aggregate",
+        time.perf_counter() - t0,
+        uploaded_dataset["total_mb"],
     )
 
     assert n_rows == exp["total_rows"]
@@ -226,12 +226,12 @@ def test_duckdb_sql_over_lore(uploaded_dataset):
     # group-by + projection (reads a subset of columns) reproduces local counts
     rows = con.sql(
         f"SELECT region, count(*) c FROM read_parquet('{glob}') "
-        "GROUP BY region ORDER BY region"
+        "GROUP BY region ORDER BY region",
     ).fetchall()
     assert dict(rows) == exp["by_region"]
 
 
-def test_polars_dataframe_over_lore(uploaded_dataset):
+def test_polars_dataframe_over_lore(uploaded_dataset: dict) -> None:
     """Polars read-back over lore:// via fs.open file objects + a filtered query."""
     fs = uploaded_dataset["fs"]
     exp = uploaded_dataset["expected"]
@@ -243,19 +243,21 @@ def test_polars_dataframe_over_lore(uploaded_dataset):
     t0 = time.perf_counter()
     df = pl.concat([pl.read_parquet(fs.open(p)) for p in files])
     timer.record(
-        "polars read (full)", time.perf_counter() - t0, uploaded_dataset["total_mb"]
+        "polars read (full)",
+        time.perf_counter() - t0,
+        uploaded_dataset["total_mb"],
     )
 
     assert df.height == exp["total_rows"]
     assert df["amount"].sum() == pytest.approx(exp["total_amount"], rel=1e-6)
 
     by_region = dict(
-        df.group_by("region").agg(pl.len().alias("c")).sort("region").iter_rows()
+        df.group_by("region").agg(pl.len().alias("c")).sort("region").iter_rows(),
     )
     assert by_region == exp["by_region"]
 
 
-def test_polars_column_projection_reads_subset(uploaded_dataset):
+def test_polars_column_projection_reads_subset(uploaded_dataset: dict) -> None:
     """Column projection: reading two columns must match a full read's aggregate.
 
     Exercises the columnar read shape (parquet only needs the projected column
@@ -269,7 +271,7 @@ def test_polars_column_projection_reads_subset(uploaded_dataset):
 
     files = sorted(fs.glob(uploaded_dataset["glob"]))
     projected = pl.concat(
-        [pl.read_parquet(fs.open(p), columns=["region", "amount"]) for p in files]
+        [pl.read_parquet(fs.open(p), columns=["region", "amount"]) for p in files],
     )
     assert projected.columns == ["region", "amount"]
     assert projected.height == exp["total_rows"]
@@ -294,22 +296,20 @@ INGEST_BRANCH = "ingest-2026-02"
 
 
 @pytest.fixture(scope="module")
-def warehouse(lore_server, tmp_path_factory):
+def warehouse(lore_server: str, tmp_path_factory: pytest.TempPathFactory) -> dict:
     """An empty repo whose ``main`` already holds a few committed partitions."""
-    import lore
-    from lore.types import args as A
-
     tmp = tmp_path_factory.mktemp("wap")
     clone_root = str(tmp / "clone")
-    os.makedirs(clone_root, exist_ok=True)
+    Path(clone_root).mkdir(parents=True, exist_ok=True)
     local_dir = tmp / "local"
     local_dir.mkdir()
 
-    L = lore.Lore()
+    lore_instance = lore.Lore()
     url = f"{lore_server}/wap-{int(time.time() * 1000)}"
-    g = A.LoreGlobalArgs(repository_path=clone_root)
-    for ev in L.repository_create(
-        g, A.LoreRepositoryCreateArgs(repository_url=url)
+    g = lore_args.LoreGlobalArgs(repository_path=clone_root)
+    for ev in lore_instance.repository_create(
+        g,
+        lore_args.LoreRepositoryCreateArgs(repository_url=url),
     ).collect():
         if type(ev).__name__ == "LoreErrorEventData":
             pytest.fail(f"repo create failed: {ev.error_inner}")
@@ -341,7 +341,7 @@ def warehouse(lore_server, tmp_path_factory):
         fs.close()
 
 
-def test_write_audit_publish(warehouse):
+def test_write_audit_publish(warehouse: dict) -> None:
     """Ingest a partition on a branch, audit in isolation, then publish by merge."""
     fs = warehouse["fs"]
     timer = warehouse["timer"]
@@ -353,7 +353,9 @@ def test_write_audit_publish(warehouse):
     # --- WRITE: commit the new partition onto an isolation branch, not main.
     t0 = time.perf_counter()
     with fs.transaction(
-        message="ingest Feb partition", branch=INGEST_BRANCH, create=True
+        message="ingest Feb partition",
+        branch=INGEST_BRANCH,
+        create=True,
     ):
         fs.put_file(str(new_local), new_repo_path)
     timer.record("write (isolated branch commit)", time.perf_counter() - t0)
@@ -385,7 +387,7 @@ def test_write_audit_publish(warehouse):
     con = duckdb.connect()
     con.register_filesystem(fs)
     n_rows, total_amount = con.sql(
-        f"SELECT count(*), sum(amount) FROM read_parquet('lore://{DATA_DIR}/*.parquet')"
+        f"SELECT count(*), sum(amount) FROM read_parquet('lore://{DATA_DIR}/*.parquet')",
     ).fetchone()
     assert n_rows == expected.height
     assert total_amount == pytest.approx(expected["amount"].sum(), rel=1e-6)

@@ -19,7 +19,7 @@ from lore_fsspec.core import LoreFileSystem
 
 
 @pytest.mark.parametrize(
-    "url, expected",
+    ("url", "expected"),
     [
         ("lore:///abs/clone:main@Content/Game.ini", "Content/Game.ini"),
         ("lore://Content/Game.ini", "Content/Game.ini"),
@@ -27,12 +27,12 @@ from lore_fsspec.core import LoreFileSystem
         ("lore:///abs/clone:main@sub/data.bin", "sub/data.bin"),
     ],
 )
-def test_strip_protocol(url, expected):
+def test_strip_protocol(url: str, expected: str) -> None:
     assert LoreFileSystem._strip_protocol(url) == expected
 
 
 @pytest.mark.parametrize(
-    "url, expected",
+    ("url", "expected"),
     [
         (
             "lore:///abs/clone:main@Content/Game.ini",
@@ -47,10 +47,10 @@ def test_strip_protocol(url, expected):
         ("lore:///abs/clone", {}),
     ],
 )
-def test_get_kwargs_from_urls(url, expected):
+def test_get_kwargs_from_urls(url: str, expected: dict) -> None:
     assert LoreFileSystem._get_kwargs_from_urls(url) == expected
 
 
-def test_inner_path_strips_ref_and_clone():
+def test_inner_path_strips_ref_and_clone() -> None:
     assert _refs.inner_path("/abs/clone:main@deep/inner.bin") == "deep/inner.bin"
     assert _refs.inner_path("/abs/clone:main@") == ""
