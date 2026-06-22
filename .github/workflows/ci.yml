@@ -47,15 +47,16 @@ jobs:
 
       - uses: jdx/mise-action@v3
 
-      # Cache the uv download cache, the resolved virtualenv, and the downloaded
-      # loreserver binary (see the `test` task in mise.toml).
+      # Cache the uv download cache and the resolved virtualenv. The loreserver
+      # now runs in an ephemeral Docker container built from tests/docker by
+      # testcontainers (see the `test` task in mise.toml); the GitHub-hosted
+      # runners ship a working Docker daemon.
       - uses: actions/cache@v4
         with:
           path: |
             ~/.cache/uv
             .venv
-            .cache/loreserver
-          key: test-${{ runner.os }}-${{ hashFiles('uv.lock') }}-lore${{ hashFiles('mise.toml') }}
+          key: test-${{ runner.os }}-${{ hashFiles('uv.lock') }}-lore${{ hashFiles('mise.toml', 'tests/docker/Dockerfile') }}
           restore-keys: |
             test-${{ runner.os }}-
 
