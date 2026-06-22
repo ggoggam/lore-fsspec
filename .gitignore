@@ -12,5 +12,5 @@ dist/
 .ruff_cache/
 .mypy_cache/
 
-# Downloaded loreserver binary (see scripts/with-loreserver.sh)
+# Local caches
 .cache/
