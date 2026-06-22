@@ -8,8 +8,6 @@ It lets any fsspec-aware tool (pandas, pyarrow, zarr, dask, `fsspec.open`, …) 
 files out of a local Lore clone at an arbitrary branch or revision via `lore://`
 URLs, backed by the official `lore` Python bindings (`liblore`).
 
-> **Status:** planning / pre-implementation. See [`docs/`](docs/).
-
 ## Planned usage
 
 ```python
@@ -62,14 +60,70 @@ with fs.transaction(message="Import", branch="import-job", create=True):
 fs.merge("import-job")
 ```
 
-## Documentation
+## Examples
 
-- [`docs/01-overview.md`](docs/01-overview.md) — what Lore is, the `lore` Python
-  API, and how it maps onto fsspec.
-- [`docs/02-design.md`](docs/02-design.md) — `LoreFileSystem` design, URL/ref
-  grammar, method-by-method mapping, open questions.
-- [`docs/03-roadmap.md`](docs/03-roadmap.md) — phased delivery plan
-  (read-only MVP → robustness → writes → content-addressed view).
+End-to-end usecases, distilled from the integration benchmark
+(`tests/test_benchmark_parquet.py`). They show the library doing real
+data-engineering work, not just listing files.
+
+### Import a dataset atomically, then query it over `lore://`
+
+Upload a multi-file parquet dataset as **one Lore revision** (all files land
+together, or none on error), then read it straight back with two engines —
+DuckDB (SQL) and Polars (DataFrame) — through the `lore://` protocol:
+
+```python
+import duckdb
+import polars as pl
+from lore_fsspec import LoreFileSystem
+
+fs = LoreFileSystem(path="/path/to/clone", writable=True)
+
+# Atomic import: every shard becomes part of a single revision.
+with fs.transaction(message="import events dataset"):
+    for shard in ("part-000.parquet", "part-001.parquet", "part-002.parquet"):
+        fs.put_file(f"/local/events/{shard}", f"warehouse/events/{shard}")
+
+# Query with DuckDB by registering the filesystem under the 'lore' protocol.
+con = duckdb.connect()
+con.register_filesystem(fs)
+rows, total = con.sql(
+    "SELECT count(*), sum(amount) "
+    "FROM read_parquet('lore://warehouse/events/*.parquet')",
+).fetchone()
+
+# Or read DataFrames directly via fs.open file objects (column projection works).
+df = pl.concat(
+    pl.read_parquet(fs.open(p), columns=["region", "amount"])
+    for p in sorted(fs.glob("warehouse/events/*.parquet"))
+)
+by_region = df.group_by("region").agg(pl.len()).sort("region")
+```
+
+### Write-audit-publish with a branch
+
+Ingest a new partition on an isolation branch, audit it **without exposing it on
+`main`**, then publish it atomically by merging — the classic
+"write-audit-publish" pattern:
+
+```python
+fs = LoreFileSystem(path="/path/to/clone", writable=True)  # starts on 'main'
+
+# WRITE: commit the new partition onto a fresh branch, not main.
+with fs.transaction(message="ingest Feb partition", branch="ingest-2026-02", create=True):
+    fs.put_file("/local/part-new.parquet", "warehouse/events/part-new.parquet")
+assert fs.ref == "main"  # the transaction restored the original branch on exit
+
+# AUDIT: main is untouched; read the new data back by targeting the branch ref.
+fs.ls("warehouse/events")                          # main: existing partitions only
+fs.ls("warehouse/events", ref="ingest-2026-02")    # branch: includes part-new
+audited = pl.read_parquet(
+    fs.open("warehouse/events/part-new.parquet", ref="ingest-2026-02"),
+)
+
+# PUBLISH: a clean merge lands as one revision; a conflicting one aborts and raises.
+fs.merge("ingest-2026-02")
+```
 
 ## Development
 
