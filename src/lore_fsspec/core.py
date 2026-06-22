@@ -727,7 +727,7 @@ class LoreFileSystem(AsyncFileSystem):
         branch is also switched to, so subsequent writes/commits land on it.
         """
         self._require_writable()
-        fsspec.asyn.sync(self.loop, self._create_branch, name, checkout)
+        fsspec.asyn.sync(self.loop, self._create_branch, name, checkout=checkout)
 
     async def _create_branch(self, name: str, *, checkout: bool) -> None:
         await self._run(self._lore.branch_create, LoreBranchCreateArgs(branch=name))
