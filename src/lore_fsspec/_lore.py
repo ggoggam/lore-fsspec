@@ -8,14 +8,22 @@ run cleanly on fsspec's dedicated event-loop thread.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from .errors import raise_for_events
 
 
 async def run(
-    command, global_args, args, *, entry_type: type | None = None, check: bool = True
-) -> list[Any]:
+    command: Callable[..., object],
+    global_args: object,
+    args: object,
+    *,
+    entry_type: type | None = None,
+    check: bool = True,
+) -> list:
     """Execute a Lore command on the running loop and return collected events.
 
     ``command`` is a bound Lore method (e.g. ``lore.repository_dump``) taking
@@ -38,8 +46,12 @@ async def run(
 
 
 def run_sync(
-    command, global_args, args, *, entry_type: type | None = None
-) -> list[Any]:
+    command: Callable[..., object],
+    global_args: object,
+    args: object,
+    *,
+    entry_type: type | None = None,
+) -> list:
     """Blocking variant for one-shot construction-time calls (clone, default ref).
 
     Uses the executor's synchronous ``collect()`` so it can run off the fsspec

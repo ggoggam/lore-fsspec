@@ -21,14 +21,15 @@ from lore_fsspec.errors import (
 )
 
 
-def test_success_does_not_raise():
+def test_success_does_not_raise() -> None:
     raise_for_events([LoreCompleteEventData(status=0), LoreEndEventData(unused=0)])
 
 
-def test_address_not_found_maps_to_filenotfound():
+def test_address_not_found_maps_to_filenotfound() -> None:
     events = [
         LoreErrorEventData(
-            error_type=int(LoreErrorCode.ADDRESS_NOT_FOUND), error_inner="missing"
+            error_type=int(LoreErrorCode.ADDRESS_NOT_FOUND),
+            error_inner="missing",
         ),
         LoreCompleteEventData(status=1),
     ]
@@ -38,24 +39,25 @@ def test_address_not_found_maps_to_filenotfound():
     assert ei.value.code == LoreErrorCode.ADDRESS_NOT_FOUND
 
 
-def test_invalid_arguments_maps_to_valueerror():
+def test_invalid_arguments_maps_to_valueerror() -> None:
     events = [
         LoreErrorEventData(
-            error_type=int(LoreErrorCode.INVALID_ARGUMENTS), error_inner="bad"
+            error_type=int(LoreErrorCode.INVALID_ARGUMENTS),
+            error_inner="bad",
         ),
         LoreCompleteEventData(status=1),
     ]
-    with pytest.raises(ValueError) as ei:
+    with pytest.raises(ValueError, match="INVALID_ARGUMENTS") as ei:
         raise_for_events(events)
     assert isinstance(ei.value, LoreInvalidArguments)
 
 
-def test_nonzero_status_without_error_event_raises_loreerror():
+def test_nonzero_status_without_error_event_raises_loreerror() -> None:
     with pytest.raises(LoreError):
         raise_for_events([LoreCompleteEventData(status=1)])
 
 
-def test_unmapped_code_raises_base_loreerror():
+def test_unmapped_code_raises_base_loreerror() -> None:
     events = [
         LoreErrorEventData(error_type=int(LoreErrorCode.INTERNAL), error_inner="boom"),
         LoreCompleteEventData(status=1),

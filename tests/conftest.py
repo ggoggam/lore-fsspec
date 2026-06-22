@@ -14,6 +14,7 @@ default ports and it will be reused.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -24,10 +25,23 @@ from pathlib import Path
 
 import pytest
 
+try:
+    import lore as _lore_module
+    import lore.types.args as lore_args
+except ImportError:
+    _lore_module = None  # type: ignore[assignment]
+    lore_args = None  # type: ignore[assignment]
+
+try:
+    from testcontainers.core.container import DockerContainer as _DockerContainer
+except ImportError:
+    _DockerContainer = None  # type: ignore[assignment,misc]
+
 # Default points at a zero-config `loreserver` on the conventional ports.
 SERVER_URL = os.environ.get("LORE_TEST_REPOSITORY_URL", "lore://127.0.0.1:41337")
 HEALTH_URL = os.environ.get(
-    "LORE_TEST_HEALTH_URL", "http://127.0.0.1:41339/health_check"
+    "LORE_TEST_HEALTH_URL",
+    "http://127.0.0.1:41339/health_check",
 )
 
 # Keep in lockstep with the lore-vcs (liblore) wheel pinned in pyproject.toml and
@@ -37,20 +51,17 @@ _DOCKERFILE_DIR = Path(__file__).parent / "docker"
 _IMAGE_TAG = f"lore-fsspec/loreserver:{LORE_SERVER_VERSION}"
 _GRPC_PORT = 41337  # gRPC (TCP) + QUIC (UDP) share this port
 _HTTP_PORT = 41339  # HTTP health check
+_HTTP_OK = 200
 
 
 def _have_liblore() -> bool:
-    try:
-        import lore  # noqa: F401
-    except Exception:
-        return False
-    return True
+    return importlib.util.find_spec("lore") is not None
 
 
 def _server_up() -> bool:
     try:
         with urllib.request.urlopen(HEALTH_URL, timeout=2) as resp:
-            return resp.status == 200
+            return resp.status == _HTTP_OK
     except (urllib.error.URLError, OSError):
         return False
 
@@ -65,8 +76,11 @@ def _wait_healthy(timeout: float = 90.0) -> bool:
 
 
 def _build_image() -> None:
-    """Build the loreserver image (linux/amd64; Docker layer cache makes reruns
-    instant once the binary download layer is cached)."""
+    """Build the loreserver image.
+
+    linux/amd64; Docker layer cache makes reruns instant once the binary
+    download layer is cached.
+    """
     subprocess.run(
         [
             "docker",
@@ -89,7 +103,8 @@ requires_lore = pytest.mark.skipif(not _have_liblore(), reason="liblore not avai
 
 
 @pytest.fixture(scope="session")
-def lore_server():
+def lore_server() -> str:  # type: ignore[return]
+    """Yield a Lore server URL, starting a container if needed."""
     if not _have_liblore():
         pytest.skip("liblore not available")
 
@@ -105,9 +120,7 @@ def lore_server():
     # Otherwise start a self-contained loreserver via testcontainers/Docker.
     if shutil.which("docker") is None:
         pytest.skip("docker not available to start a loreserver container")
-    try:
-        from testcontainers.core.container import DockerContainer
-    except ImportError:
+    if _DockerContainer is None:
         pytest.skip("testcontainers not installed")
 
     try:
@@ -116,7 +129,7 @@ def lore_server():
         pytest.fail(f"failed to build loreserver image:\n{exc.stderr or exc.stdout}")
 
     container = (
-        DockerContainer(_IMAGE_TAG)
+        _DockerContainer(_IMAGE_TAG)
         # Fixed (not random) host ports: liblore uses the single URL port for both
         # gRPC (TCP) and QUIC (UDP), so both must map 1:1 to the same host port.
         .with_bind_ports(f"{_GRPC_PORT}/tcp", _GRPC_PORT)
@@ -145,7 +158,7 @@ def lore_server():
 
 
 @pytest.fixture
-def fixture_repo(lore_server, tmp_path):
+def fixture_repo(lore_server: str, tmp_path: Path) -> dict:
     """Create a scratch repo with a couple of committed files; yield its clone root.
 
     Layout::
@@ -154,23 +167,22 @@ def fixture_repo(lore_server, tmp_path):
         sub/data.bin
         Content/Config/Game.ini
     """
-    import lore
-    from lore.types import args as A
-
-    L = lore.Lore()
+    lore_instance = _lore_module.Lore()
     root = str(tmp_path / "clone")
-    os.makedirs(root, exist_ok=True)
+    Path(root).mkdir(parents=True, exist_ok=True)
     url = f"{lore_server}/pytest-{int(time.time() * 1000)}"
-    g = A.LoreGlobalArgs(repository_path=root)
+    g = lore_args.LoreGlobalArgs(repository_path=root)
 
-    def run(executor):
+    def run(executor: object) -> list:
         events = executor.collect()
         for e in events:
             if type(e).__name__ == "LoreErrorEventData":
-                raise RuntimeError(f"lore setup failed: {e.error_inner}")
+                msg = f"lore setup failed: {e.error_inner}"
+                raise RuntimeError(msg)
         return events
 
-    run(L.repository_create(g, A.LoreRepositoryCreateArgs(repository_url=url)))
+    create_args = lore_args.LoreRepositoryCreateArgs(repository_url=url)
+    run(lore_instance.repository_create(g, create_args))
 
     files = {
         "hello.txt": b"hello lore world\n" * 3,
@@ -178,11 +190,12 @@ def fixture_repo(lore_server, tmp_path):
         "Content/Config/Game.ini": b"[core]\nname=lore\n",
     }
     for rel, data in files.items():
-        abspath = os.path.join(root, rel)
-        os.makedirs(os.path.dirname(abspath), exist_ok=True)
-        with open(abspath, "wb") as f:
-            f.write(data)
-        run(L.file_stage(g, A.LoreFileStageArgs(paths=[abspath], scan=True)))
-    run(L.revision_commit(g, A.LoreRevisionCommitArgs(message="fixture")))
+        abspath = str(Path(root) / rel)
+        Path(abspath).parent.mkdir(parents=True, exist_ok=True)
+        Path(abspath).write_bytes(data)
+        stage_args = lore_args.LoreFileStageArgs(paths=[abspath], scan=True)
+        run(lore_instance.file_stage(g, stage_args))
+    commit_args = lore_args.LoreRevisionCommitArgs(message="fixture")
+    run(lore_instance.revision_commit(g, commit_args))
 
     return {"root": root, "url": url, "files": files}

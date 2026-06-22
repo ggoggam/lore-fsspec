@@ -19,16 +19,21 @@ Path model (validated against a live server):
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Self
+
 import asyncio
+import contextlib
 import datetime
 import io
-import os
+from pathlib import Path
 
 import fsspec.asyn
+import lore
 from fsspec.asyn import AbstractAsyncStreamedFile, AsyncFileSystem
 from fsspec.implementations.memory import MemoryFile
-
-import lore
 from lore.types import LoreAddress
 from lore.types.args import (
     LoreBranchCreateArgs,
@@ -72,6 +77,8 @@ from .transaction import LoreTransaction
 
 
 class LoreFileSystem(AsyncFileSystem):
+    """An fsspec filesystem backed by a local Lore VCS clone."""
+
     protocol = "lore"
     cachable = True  # instances cached by (path, ref), like GitFileSystem
     root_marker = ""
@@ -83,13 +90,15 @@ class LoreFileSystem(AsyncFileSystem):
         path: str | None = None,
         fo: str | None = None,
         ref: str | None = None,
+        *,
         offline: bool = False,
         identity: str | None = None,
         writable: bool = False,
         asynchronous: bool = False,
-        loop=None,
-        **kwargs,
-    ):
+        loop: object = None,
+        **kwargs: object,
+    ) -> None:
+        """Attach to a local Lore clone, optionally cloning from ``fo`` first."""
         super().__init__(asynchronous=asynchronous, loop=loop, **kwargs)
         self._lore = lore.Lore()
         self.identity = identity
@@ -108,15 +117,15 @@ class LoreFileSystem(AsyncFileSystem):
         self._repo_lock = asyncio.Lock()
         self._store_lock = asyncio.Lock()
 
-        clone_root = os.path.abspath(path or fo or os.getcwd())
+        clone_root = str(Path(path or fo or Path.cwd()).resolve())
         # Bootstrap: if `path` has no clone yet and `fo` is a Lore server URL,
         # clone it once; otherwise `fo` is just an alias for `path`.
         if fo and not _is_lore_clone(clone_root):
-            if str(fo).startswith(_refs._PREFIX):
-                clone_root = os.path.abspath(path or os.getcwd())
+            if str(fo).startswith(_refs.PREFIX):
+                clone_root = str(Path(path or Path.cwd()).resolve())
                 self._clone(fo, clone_root)
             else:
-                clone_root = os.path.abspath(fo)
+                clone_root = str(Path(fo).resolve())
         self.clone_root = clone_root
 
         self.ref = ref or self._default_ref()
@@ -131,7 +140,7 @@ class LoreFileSystem(AsyncFileSystem):
         )
 
     def _clone(self, url: str, dest: str) -> None:
-        os.makedirs(dest, exist_ok=True)
+        Path(dest).mkdir(parents=True, exist_ok=True)
         gargs = LoreGlobalArgs(repository_path=dest, identity=self.identity or "")
         _lore.run_sync(
             self._lore.repository_clone,
@@ -148,7 +157,7 @@ class LoreFileSystem(AsyncFileSystem):
                 LoreBranchListArgs(),
                 entry_type=LoreBranchListEntryEventData,
             )
-        except Exception:
+        except LoreError:
             return ""
         for e in entries:
             if getattr(e, "is_current", False):
@@ -168,7 +177,7 @@ class LoreFileSystem(AsyncFileSystem):
     def _abs(self, inner: str) -> str:
         """Map a repo-relative inner path to an absolute working-copy path."""
         inner = inner.strip("/")
-        return os.path.join(self.clone_root, inner) if inner else self.clone_root
+        return str(Path(self.clone_root) / inner) if inner else self.clone_root
 
     async def _resolve_rev(self, ref: str | None) -> str:
         """Translate a ref into the ``revision`` arg the ``lore`` commands want.
@@ -227,7 +236,14 @@ class LoreFileSystem(AsyncFileSystem):
         return info
 
     # ------------------------------------------------------------------ reads
-    async def _ls(self, path, detail=True, ref=None, **kwargs):
+    async def _ls(
+        self,
+        path: str,
+        *,
+        detail: bool = True,
+        ref: str | None = None,
+        **_kwargs: object,
+    ) -> list:
         inner = self._strip_protocol(path)
         abspath = self._abs(inner)
         rev = await self._resolve_rev(ref)
@@ -246,7 +262,7 @@ class LoreFileSystem(AsyncFileSystem):
             out = [self._node_info(root, base)]
         else:
             out = [
-                self._node_info(n, _join(base, os.path.basename(n.name.rstrip("/"))))
+                self._node_info(n, _join(base, Path(n.name.rstrip("/")).name))
                 for n in nodes
                 if n.id != root.id and n.parent == root.id
             ]
@@ -254,7 +270,7 @@ class LoreFileSystem(AsyncFileSystem):
             return out
         return sorted(i["name"] for i in out)
 
-    async def _info(self, path, ref=None, **kwargs):
+    async def _info(self, path: str, ref: str | None = None, **_kwargs: object) -> dict:
         inner = self._strip_protocol(path)
         if inner in ("", "/"):
             return {"name": "", "size": 0, "type": "directory"}
@@ -278,7 +294,14 @@ class LoreFileSystem(AsyncFileSystem):
             "local_size": ev.local_size,
         }
 
-    async def _cat_file(self, path, start=None, end=None, ref=None, **kwargs):
+    async def _cat_file(
+        self,
+        path: str,
+        start: int | None = None,
+        end: int | None = None,
+        ref: str | None = None,
+        **_kwargs: object,
+    ) -> bytes:
         """Read file bytes.
 
         Two read paths, picked by what's cheapest and correct:
@@ -298,14 +321,13 @@ class LoreFileSystem(AsyncFileSystem):
             raise IsADirectoryError(path)
         abspath = self._abs(inner)
 
-        on_disk = os.path.isfile(abspath)
+        on_disk = Path(abspath).is_file()
         if (
             await self._resolve_rev(ref) == ""
             and on_disk
             and info.get("local_size") == info.get("size")
         ):
-            with open(abspath, "rb") as f:
-                return f.read()[start:end]
+            return Path(abspath).read_bytes()[start:end]
 
         hash_b = bytes.fromhex(info["hash"])
         if not any(hash_b):  # default/zero hash == empty content
@@ -314,13 +336,15 @@ class LoreFileSystem(AsyncFileSystem):
             data = await self._storage_get(hash_b, bytes.fromhex(info["context"]))
         except FileNotFoundError:
             if on_disk:
-                with open(abspath, "rb") as f:
-                    return f.read()[start:end]
+                return Path(abspath).read_bytes()[start:end]
             if self.offline:
-                raise FileNotFoundError(
+                msg = (
                     f"{path!r}: content fragment is not resident locally and "
                     f"offline=True; run fs.fetch(...) or construct the filesystem "
                     f"with offline=False to allow lazy fetching"
+                )
+                raise FileNotFoundError(
+                    msg,
                 ) from None
             raise
         return data[start:end]
@@ -413,11 +437,11 @@ class LoreFileSystem(AsyncFileSystem):
                 buf[ev.offset : ev.offset + len(ev.bytes)] = ev.bytes
         return bytes(buf)
 
-    def ukey(self, path):
+    def ukey(self, path: str) -> str:
         """Stable cache key = the Lore content address (mirrors GitFileSystem)."""
         return self.info(path)["hash"]
 
-    def modified(self, path) -> datetime.datetime:
+    def modified(self, path: str) -> datetime.datetime:
         """Modification time of a path, as a UTC ``datetime``.
 
         Lore is content-addressed: a path's bytes are immutable for a given
@@ -430,21 +454,22 @@ class LoreFileSystem(AsyncFileSystem):
         """
         abspath = self._abs(self._strip_protocol(path))
         try:
-            ts = os.stat(abspath).st_mtime
+            ts = Path(abspath).stat().st_mtime
         except OSError:
             ts = 0.0
-        return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+        return datetime.datetime.fromtimestamp(ts, tz=datetime.UTC)
 
     def _open(
         self,
-        path,
-        mode="rb",
-        block_size=None,
-        autocommit=True,
-        cache_options=None,
-        ref=None,
-        **kwargs,
-    ):
+        path: str,
+        mode: str = "rb",
+        _block_size: int | None = None,
+        _autocommit: bool = True,  # noqa: FBT001, FBT002
+        _cache_options: dict | None = None,
+        ref: str | None = None,
+        **_kwargs: object,
+    ) -> MemoryFile | LoreBufferedWriter:
+        """Open a file for reading or writing."""
         if mode == "rb":
             data = self.cat_file(path, ref=ref)
             return MemoryFile(self, path, data)
@@ -453,9 +478,16 @@ class LoreFileSystem(AsyncFileSystem):
             if mode == "xb" and self.exists(path):
                 raise FileExistsError(path)
             return LoreBufferedWriter(self, path)
-        raise NotImplementedError(f"unsupported mode {mode!r}; use 'rb' or 'wb'")
+        msg = f"unsupported mode {mode!r}; use 'rb' or 'wb'"
+        raise NotImplementedError(msg)
 
-    async def open_async(self, path, mode="rb", ref=None, **kwargs):
+    async def open_async(
+        self,
+        path: str,
+        mode: str = "rb",
+        ref: str | None = None,
+        **_kwargs: object,
+    ) -> LoreAsyncStreamedFile:
         """Async streaming reads — the large-asset path for Lore.
 
         Returns an :class:`AbstractAsyncStreamedFile` whose ``_fetch_range`` maps
@@ -464,9 +496,12 @@ class LoreFileSystem(AsyncFileSystem):
         ``MemoryFile`` does). Read-only, mirroring ``_open``.
         """
         if mode != "rb":
-            raise NotImplementedError(
+            msg = (
                 "open_async supports read-only 'rb'; writes go through "
                 "fs.transaction(...) + pipe_file"
+            )
+            raise NotImplementedError(
+                msg,
             )
         info = await self._info(path, ref=ref)
         if info["type"] != "file":
@@ -482,9 +517,12 @@ class LoreFileSystem(AsyncFileSystem):
         Lore operation, not a batch staged across several calls.
         """
         if not self.writable:
-            raise PermissionError(
+            msg = (
                 "LoreFileSystem is read-only; construct it with writable=True to "
                 "enable writes"
+            )
+            raise PermissionError(
+                msg,
             )
 
     def _require_write(self) -> None:
@@ -497,17 +535,20 @@ class LoreFileSystem(AsyncFileSystem):
         """
         self._require_writable()
         if not getattr(self, "_intrans", False):
-            raise ValueError(
+            msg = (
                 "writes must occur inside a transaction so they commit as one "
                 "atomic revision; use `with fs.transaction(message=...): ...`"
+            )
+            raise ValueError(
+                msg,
             )
 
     def _stage(self, abspath: str) -> None:
         """Record an absolute path as touched by the current transaction."""
         if getattr(self, "_intrans", False) and self._transaction is not None:
-            self._transaction._staged.append(abspath)
+            self._transaction.record_staged(abspath)
 
-    async def _pipe_file(self, path, value, **kwargs):
+    async def _pipe_file(self, path: str, value: bytes, **_kwargs: object) -> None:
         """Author bytes into the working copy and stage them.
 
         Authoring is ordinary file I/O into the clone (Lore's ``file_write`` is
@@ -517,25 +558,28 @@ class LoreFileSystem(AsyncFileSystem):
         self._require_write()
         inner = self._strip_protocol(path)
         abspath = self._abs(inner)
-        parent = os.path.dirname(abspath)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(abspath, "wb") as f:
-            f.write(value)
+        parent = Path(abspath).parent
+        if parent.name:
+            parent.mkdir(parents=True, exist_ok=True)
+        Path(abspath).write_bytes(value)
         await self._run(
-            self._lore.file_stage, LoreFileStageArgs(paths=[abspath], scan=True)
+            self._lore.file_stage,
+            LoreFileStageArgs(paths=[abspath], scan=True),
         )
         self._stage(abspath)
-        return None
 
-    async def _put_file(self, lpath, rpath, mode="overwrite", **kwargs):
+    async def _put_file(
+        self,
+        lpath: str,
+        rpath: str,
+        _mode: str = "overwrite",
+        **_kwargs: object,
+    ) -> None:
         """Copy a local file into the working copy and stage it."""
-        with open(lpath, "rb") as f:
-            data = f.read()
+        data = Path(lpath).read_bytes()
         await self._pipe_file(rpath, data)
-        return None
 
-    async def _rm_file(self, path, **kwargs):
+    async def _rm_file(self, path: str, **_kwargs: object) -> None:
         """Remove a file from the tree: delete on disk, then stage the deletion.
 
         Mirrors the working-copy model used everywhere else here — Lore's
@@ -547,15 +591,22 @@ class LoreFileSystem(AsyncFileSystem):
         self._require_write()
         inner = self._strip_protocol(path)
         abspath = self._abs(inner)
-        if os.path.isfile(abspath):
-            os.remove(abspath)
+        if Path(abspath).is_file():
+            Path(abspath).unlink()
         await self._run(
-            self._lore.file_stage, LoreFileStageArgs(paths=[abspath], scan=True)
+            self._lore.file_stage,
+            LoreFileStageArgs(paths=[abspath], scan=True),
         )
         self._stage(abspath)
-        return None
 
-    def mv(self, path1, path2, recursive=False, maxdepth=None, **kwargs):
+    def mv(
+        self,
+        path1: str,
+        path2: str,
+        _recursive: bool = False,  # noqa: FBT001, FBT002
+        _maxdepth: int | None = None,
+        **_kwargs: object,
+    ) -> None:
         """Rename within the working copy, staged as part of the open transaction.
 
         Done as an on-disk ``os.rename`` plus a ``file_stage(scan=True)`` of both
@@ -566,36 +617,50 @@ class LoreFileSystem(AsyncFileSystem):
         """
         fsspec.asyn.sync(self.loop, self._mv_async, path1, path2)
 
-    async def _mv_async(self, path1, path2):
+    async def _mv_async(self, path1: str, path2: str) -> None:
         self._require_write()
         src = self._abs(self._strip_protocol(path1))
         dst = self._abs(self._strip_protocol(path2))
-        parent = os.path.dirname(dst)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        os.rename(src, dst)
+        parent = Path(dst).parent
+        if parent.name:
+            parent.mkdir(parents=True, exist_ok=True)
+        Path(src).rename(dst)
         await self._run(
-            self._lore.file_stage, LoreFileStageArgs(paths=[src, dst], scan=True)
+            self._lore.file_stage,
+            LoreFileStageArgs(paths=[src, dst], scan=True),
         )
         self._stage(src)
         self._stage(dst)
-        return None
 
-    def _commit_revision(self, message, metadata=None):
-        fsspec.asyn.sync(self.loop, self._commit_revision_async, message, metadata)
+    def _commit_revision(
+        self,
+        message: str | None,
+        metadata: dict | None = None,
+    ) -> None:
+        fsspec.asyn.sync(
+            self.loop,
+            self._commit_revision_async,
+            message,
+            metadata,
+        )
 
-    async def _commit_revision_async(self, message, metadata):
+    async def _commit_revision_async(
+        self,
+        message: str | None,
+        _metadata: dict | None,
+    ) -> None:
         await self._run(
-            self._lore.revision_commit, LoreRevisionCommitArgs(message=message or "")
+            self._lore.revision_commit,
+            LoreRevisionCommitArgs(message=message or ""),
         )
         if not self.offline:
             await self._run(self._lore.branch_push, LoreBranchPushArgs())
 
-    def _reset_paths(self, paths):
+    def _reset_paths(self, paths: list[str]) -> None:
         if paths:
             fsspec.asyn.sync(self.loop, self._reset_async, paths)
 
-    async def _reset_async(self, paths):
+    async def _reset_async(self, paths: list[str]) -> None:
         """Exact rollback of staged paths (transaction abort).
 
         ``file_reset`` errors on a *staged* node, so first ``file_unstage`` to
@@ -606,7 +671,8 @@ class LoreFileSystem(AsyncFileSystem):
         """
         await self._run(self._lore.file_unstage, LoreFileUnstageArgs(paths=paths))
         await self._run(
-            self._lore.file_reset, LoreFileResetArgs(paths=paths, purge=True)
+            self._lore.file_reset,
+            LoreFileResetArgs(paths=paths, purge=True),
         )
 
     # --------------------------------------------------------------- fetch
@@ -652,7 +718,7 @@ class LoreFileSystem(AsyncFileSystem):
         )
         return sorted({e.name for e in entries})
 
-    def create_branch(self, name: str, checkout: bool = False) -> None:
+    def create_branch(self, name: str, *, checkout: bool = False) -> None:
         """Create a branch at the current branch tip (like ``git branch``).
 
         Repo topology is deliberately *not* a transaction concern (transactions
@@ -661,9 +727,9 @@ class LoreFileSystem(AsyncFileSystem):
         branch is also switched to, so subsequent writes/commits land on it.
         """
         self._require_writable()
-        fsspec.asyn.sync(self.loop, self._create_branch, name, checkout)
+        fsspec.asyn.sync(self.loop, self._create_branch, name, checkout=checkout)
 
-    async def _create_branch(self, name: str, checkout: bool) -> None:
+    async def _create_branch(self, name: str, *, checkout: bool) -> None:
         await self._run(self._lore.branch_create, LoreBranchCreateArgs(branch=name))
         if checkout:
             await self._run(self._lore.branch_switch, LoreBranchSwitchArgs(branch=name))
@@ -721,20 +787,27 @@ class LoreFileSystem(AsyncFileSystem):
     async def _close_async(self, handle: int) -> None:
         await self._run(self._lore.storage_close, LoreStorageCloseArgs(handle=handle))
 
-    def __enter__(self):
+    def __enter__(self) -> Self:
+        """Enter context manager."""
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *exc: object) -> None:
+        """Exit context manager and flush writes."""
         self.close()
 
-    def __del__(self):
-        try:
+    def __del__(self) -> None:
+        """Destructor: close the store handle on GC."""
+        with contextlib.suppress(Exception):
             self.close()
-        except Exception:
-            pass
 
     # -------------------------------------------------------------- internals
-    async def _run(self, command, cmd_args, *, entry_type=None):
+    async def _run(
+        self,
+        command: object,
+        cmd_args: object,
+        *,
+        entry_type: type | None = None,
+    ) -> list:
         return await _lore.run(command, self._gargs(), cmd_args, entry_type=entry_type)
 
 
@@ -746,12 +819,24 @@ class LoreAsyncStreamedFile(AbstractAsyncStreamedFile):
     pulls exactly its range via ``_fetch_range`` → ``_cat_file``).
     """
 
-    def __init__(self, fs, path, size, ref):
+    def __init__(
+        self,
+        fs: LoreFileSystem,
+        path: str,
+        size: int,
+        ref: str | None,
+    ) -> None:
+        """Initialize with filesystem, path, known size, and optional ref."""
         super().__init__(fs, path, mode="rb", size=size, cache_type="none")
         self._ref = ref
 
-    async def _fetch_range(self, start, end):
-        return await self.fs._cat_file(self.path, start=start, end=end, ref=self._ref)
+    async def _fetch_range(self, start: int, end: int) -> bytes:
+        return await self.fs._cat_file(  # noqa: SLF001
+            self.path,
+            start=start,
+            end=end,
+            ref=self._ref,
+        )
 
 
 class LoreBufferedWriter(io.BytesIO):
@@ -762,27 +847,31 @@ class LoreBufferedWriter(io.BytesIO):
     them to ``fs.pipe_file`` (which stages them into the open transaction).
     """
 
-    def __init__(self, fs, path):
+    def __init__(self, fs: LoreFileSystem, path: str) -> None:
+        """Initialize with a filesystem and the destination path."""
         super().__init__()
         self._fs = fs
         self._path = path
         self._committed = False
 
-    def close(self):
+    def close(self) -> None:
+        """Flush buffered bytes to the filesystem and close."""
         if not self._committed and not self.closed:
             self._committed = True
             self._fs.pipe_file(self._path, self.getvalue())
         super().close()
 
-    def __enter__(self):
+    def __enter__(self) -> Self:
+        """Enter context manager."""
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *exc: object) -> None:
+        """Exit context manager and flush writes."""
         self.close()
 
 
 def _is_lore_clone(path: str) -> bool:
-    return os.path.isdir(os.path.join(path, ".lore"))
+    return (Path(path) / ".lore").is_dir()
 
 
 def _join(base: str, leaf: str) -> str:

@@ -22,7 +22,8 @@ class LoreError(Exception):
     idiomatic exception type.
     """
 
-    def __init__(self, code: LoreErrorCode | int | None, inner: str = ""):
+    def __init__(self, code: LoreErrorCode | int | None, inner: str = "") -> None:
+        """Initialize with an error code and optional message."""
         try:
             self.code = LoreErrorCode(int(code)) if code is not None else None
         except (ValueError, TypeError):
@@ -33,17 +34,20 @@ class LoreError(Exception):
 
 
 class LoreFileNotFoundError(LoreError, FileNotFoundError):
-    pass
+    """Raised when a Lore address or path is not found."""
 
 
-class LoreInvalidArguments(LoreError, ValueError):
-    pass
+class LoreInvalidArgumentsError(LoreError, ValueError):
+    """Raised when Lore rejects arguments as invalid."""
+
+
+LoreInvalidArguments = LoreInvalidArgumentsError
 
 
 # LoreErrorCode -> LoreError subclass. Unmapped codes fall back to LoreError.
 _CODE_TO_EXC: dict[LoreErrorCode, type[LoreError]] = {
     LoreErrorCode.ADDRESS_NOT_FOUND: LoreFileNotFoundError,
-    LoreErrorCode.INVALID_ARGUMENTS: LoreInvalidArguments,
+    LoreErrorCode.INVALID_ARGUMENTS: LoreInvalidArgumentsError,
 }
 
 

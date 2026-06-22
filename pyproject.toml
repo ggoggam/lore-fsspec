@@ -35,6 +35,36 @@ docs = [
     "pdoc>=15.0.0",
 ]
 
+[tool.ruff]
+line-length = 88
+indent-width = 4
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "PLR0913",  # too many arguments -- fsspec constructors require it
+    "ASYNC230",  # blocking open() in async -- fsspec runs async on a thread
+    "ASYNC240",  # os.path in async -- fsspec runs async on a thread
+    "S310",     # URL open -- health-check urlopen in test fixtures
+    "S603",     # subprocess -- docker invocation in test fixtures
+    "S607",     # partial executable path -- 'docker' resolved via PATH
+    "S608",     # SQL injection -- test benchmarks use controlled f-strings
+]
+pydocstyle = { convention = "google" }
+
+[tool.ruff.lint.per-file-ignores]
+"tests/test_*.py" = [
+    "S101",
+    "D103",
+    "SLF001",  # tests legitimately inspect private implementation attributes
+]
+"tests/conftest.py" = [
+    "SLF001",
+]
+"src/lore_fsspec/transaction.py" = [
+    "SLF001",  # LoreTransaction collaborates with LoreFileSystem internals by design
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [

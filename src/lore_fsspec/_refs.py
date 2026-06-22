@@ -14,7 +14,7 @@ URL grammar (mirrors ``GitFileSystem`` verbatim)::
 from __future__ import annotations
 
 PROTOCOL = "lore"
-_PREFIX = f"{PROTOCOL}://"
+PREFIX = f"{PROTOCOL}://"
 
 
 def split_url(path: str) -> dict[str, str]:
@@ -25,8 +25,7 @@ def split_url(path: str) -> dict[str, str]:
     ``@<inner>`` is the in-repo path and is dropped here (it is recovered by
     ``_strip_protocol``).
     """
-    if path.startswith(_PREFIX):
-        path = path[len(_PREFIX) :]
+    path = path.removeprefix(PREFIX)
     out: dict[str, str] = {}
     if ":" in path:
         out["path"], path = path.split(":", 1)

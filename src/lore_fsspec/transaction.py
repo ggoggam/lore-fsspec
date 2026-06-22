@@ -9,15 +9,25 @@ server unless the filesystem is ``offline``.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from fsspec.transaction import Transaction
+
+if TYPE_CHECKING:
+    from lore_fsspec.core import LoreFileSystem
 
 
 class LoreTransaction(Transaction):
     """Batch staged writes into a single ``revision_commit`` (+ optional push)."""
 
     def __init__(
-        self, fs, message: str | None = None, metadata: dict | None = None, **kwargs
-    ):
+        self,
+        fs: LoreFileSystem,
+        message: str | None = None,
+        metadata: dict | None = None,
+        **kwargs: object,
+    ) -> None:
+        """Initialize the transaction with optional commit message and metadata."""
         super().__init__(fs, **kwargs)
         self.message = message
         self.metadata = metadata or {}
@@ -31,6 +41,7 @@ class LoreTransaction(Transaction):
         message: str | None = None,
         metadata: dict | None = None,
         branch: str | None = None,
+        *,
         create: bool = False,
     ) -> LoreTransaction:
         """Configure the commit, then return self.
@@ -57,7 +68,12 @@ class LoreTransaction(Transaction):
             self.create = create
         return self
 
-    def start(self):
+    def record_staged(self, path: str) -> None:
+        """Record an absolute path as touched during the current transaction."""
+        self._staged.append(path)
+
+    def start(self) -> None:
+        """Begin the transaction: reset staged state and switch branch if needed."""
         super().start()  # resets self.files (deque) for a fresh transaction
         self.fs._intrans = True
         self._staged = []
@@ -69,7 +85,8 @@ class LoreTransaction(Transaction):
             else:
                 self.fs.switch_branch(self.branch)
 
-    def complete(self, commit: bool = True):
+    def complete(self, commit: bool = True) -> None:  # noqa: FBT001, FBT002
+        """Commit or roll back all staged writes as one atomic revision."""
         try:
             if commit:
                 # Files written during the txn were already staged on write.
