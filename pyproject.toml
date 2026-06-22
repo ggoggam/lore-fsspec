@@ -20,6 +20,11 @@ build-backend = "hatchling.build"
 packages = ["src/lore_fsspec"]
 
 [dependency-groups]
+bench = [
+    "duckdb>=1.5.4",
+    "numpy>=2.5.0",
+    "polars>=1.41.2",
+]
 dev = [
     "pytest>=9.1.1",
     "pytest-xdist>=3.8.0",

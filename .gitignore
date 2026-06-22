@@ -17,3 +17,7 @@ dist/
 
 # Built docs
 site/
+
+# Misc
+.claude/
+.DS_Store

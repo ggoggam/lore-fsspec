@@ -20,6 +20,7 @@ Path model (validated against a live server):
 from __future__ import annotations
 
 import asyncio
+import datetime
 import io
 import os
 
@@ -410,6 +411,24 @@ class LoreFileSystem(AsyncFileSystem):
     def ukey(self, path):
         """Stable cache key = the Lore content address (mirrors GitFileSystem)."""
         return self.info(path)["hash"]
+
+    def modified(self, path) -> datetime.datetime:
+        """Modification time of a path, as a UTC ``datetime``.
+
+        Lore is content-addressed: a path's bytes are immutable for a given
+        revision, so any value that changes when the content changes is correct
+        for cache-invalidation callers (notably DuckDB's fsspec integration,
+        which *requires* ``modified`` and otherwise raises ``NotImplementedError``).
+        We report the working-copy file's mtime when the content is materialized
+        on disk, and fall back to the epoch for content that lives only in the
+        store.
+        """
+        abspath = self._abs(self._strip_protocol(path))
+        try:
+            ts = os.stat(abspath).st_mtime
+        except OSError:
+            ts = 0.0
+        return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
 
     def _open(
         self,
