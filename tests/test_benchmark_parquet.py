@@ -10,6 +10,11 @@ This closes the gap recorded in ``docs/03-roadmap.md`` (Phase 2): the ranged /
 columnar read path was previously verified only *synthetically* because pyarrow
 wasn't installed. Here it's a genuine parquet round-trip.
 
+A second end-to-end scenario (``test_write_audit_publish``) exercises the
+branch/merge API as a data team would: ingest a new partition on an isolation
+branch, audit it without exposing it on ``main``, then publish it atomically by
+merging — the "write-audit-publish" pattern.
+
 Sizing is env-tunable so the same module serves CI (moderate default) and ad-hoc
 perf runs::
 
@@ -55,9 +60,11 @@ DATA_DIR = "warehouse/events"  # in-repo (repo-relative) destination
 
 
 class _Timer:
-    """Records named phase durations and prints one throughput table at teardown."""
+    """Records named phase durations and prints one timing table at teardown."""
 
-    def __init__(self) -> None:
+    def __init__(self, title: str, subtitle: str = "") -> None:
+        self.title = title
+        self.subtitle = subtitle
         self.rows: list[tuple[str, float, float | None]] = []
 
     def record(self, label: str, seconds: float, mb: float | None = None) -> None:
@@ -65,8 +72,9 @@ class _Timer:
 
     def report(self) -> None:
         print("\n" + "=" * 64)
-        print("lore-fsspec parquet benchmark")
-        print(f"  files={N_FILES} rows/file={ROWS_PER_FILE:,} row_group={ROW_GROUP:,}")
+        print(self.title)
+        if self.subtitle:
+            print(f"  {self.subtitle}")
         print("-" * 64)
         print(f"  {'phase':<34}{'time(s)':>10}{'MB/s':>12}")
         for label, secs, mb in self.rows:
@@ -75,15 +83,15 @@ class _Timer:
         print("=" * 64)
 
 
-def _make_parquet(path: str, *, seed: int) -> int:
-    """Write one parquet shard of ``ROWS_PER_FILE`` rows; return its byte size.
+def _make_parquet(path: str, *, seed: int, rows: int = ROWS_PER_FILE) -> int:
+    """Write one parquet shard of ``rows`` rows; return its byte size.
 
     A small star-schema-ish fact table (timestamp, region, user, amount,
     quantity) so the read-back queries are meaningful (group-by region, filter by
     amount) rather than a single trivial column.
     """
     rng = np.random.default_rng(seed)
-    n = ROWS_PER_FILE
+    n = rows
     base = np.datetime64("2026-01-01T00:00:00.000000")
     regions = np.array(REGIONS)
     df = pl.DataFrame(
@@ -112,7 +120,10 @@ def uploaded_dataset(lore_server, tmp_path_factory):
     import lore
     from lore.types import args as A
 
-    timer = _Timer()
+    timer = _Timer(
+        "lore-fsspec parquet benchmark",
+        f"files={N_FILES} rows/file={ROWS_PER_FILE:,} row_group={ROW_GROUP:,}",
+    )
     tmp = tmp_path_factory.mktemp("bench")
     clone_root = str(tmp / "clone")
     os.makedirs(clone_root, exist_ok=True)
@@ -263,3 +274,120 @@ def test_polars_column_projection_reads_subset(uploaded_dataset):
     assert projected.columns == ["region", "amount"]
     assert projected.height == exp["total_rows"]
     assert projected["amount"].sum() == pytest.approx(exp["total_amount"], rel=1e-6)
+
+
+# --------------------------------------------------------------------------
+# End-to-end: the write-audit-publish (WAP) pattern with branch + merge.
+#
+# The canonical reason a data team wants branches: ingest a new partition on an
+# isolation branch, validate it *without* exposing it on main, then publish it
+# atomically by merging. This exercises `create_branch` / `transaction(branch=,
+# create=True)` / read-at-ref / `merge` together against real parquet + DuckDB.
+# It uses its own repo so it can't perturb the shared `uploaded_dataset` above.
+# --------------------------------------------------------------------------
+
+# Smaller than the throughput benchmark: this scenario measures the *workflow*,
+# not scan speed, so a few light shards keep it quick.
+WAP_BASE_FILES = 2
+WAP_ROWS = int(os.environ.get("LORE_BENCH_WAP_ROWS", "200000"))
+INGEST_BRANCH = "ingest-2026-02"
+
+
+@pytest.fixture(scope="module")
+def warehouse(lore_server, tmp_path_factory):
+    """An empty repo whose ``main`` already holds a few committed partitions."""
+    import lore
+    from lore.types import args as A
+
+    tmp = tmp_path_factory.mktemp("wap")
+    clone_root = str(tmp / "clone")
+    os.makedirs(clone_root, exist_ok=True)
+    local_dir = tmp / "local"
+    local_dir.mkdir()
+
+    L = lore.Lore()
+    url = f"{lore_server}/wap-{int(time.time() * 1000)}"
+    g = A.LoreGlobalArgs(repository_path=clone_root)
+    for ev in L.repository_create(
+        g, A.LoreRepositoryCreateArgs(repository_url=url)
+    ).collect():
+        if type(ev).__name__ == "LoreErrorEventData":
+            pytest.fail(f"repo create failed: {ev.error_inner}")
+
+    # Seed main with the existing warehouse partitions, as one revision.
+    base_locals = []
+    for i in range(WAP_BASE_FILES):
+        p = local_dir / f"part-{i:03d}.parquet"
+        _make_parquet(str(p), seed=i, rows=WAP_ROWS)
+        base_locals.append(p)
+
+    fs = LoreFileSystem(path=clone_root, writable=True, skip_instance_cache=True)
+    with fs.transaction(message="seed warehouse"):
+        for p in base_locals:
+            fs.put_file(str(p), f"{DATA_DIR}/{p.name}")
+
+    base_df = pl.concat([pl.read_parquet(str(p)) for p in base_locals])
+    try:
+        yield {
+            "fs": fs,
+            "local_dir": local_dir,
+            "base_df": base_df,
+            "timer": _Timer(
+                "lore-fsspec write-audit-publish (branch + merge)",
+                f"base_files={WAP_BASE_FILES} rows/file={WAP_ROWS:,}",
+            ),
+        }
+    finally:
+        fs.close()
+
+
+def test_write_audit_publish(warehouse):
+    """Ingest a partition on a branch, audit in isolation, then publish by merge."""
+    fs = warehouse["fs"]
+    timer = warehouse["timer"]
+    new_local = warehouse["local_dir"] / "part-new.parquet"
+    _make_parquet(str(new_local), seed=999, rows=WAP_ROWS)
+    new_repo_path = f"{DATA_DIR}/{new_local.name}"
+    new_df = pl.read_parquet(str(new_local))
+
+    # --- WRITE: commit the new partition onto an isolation branch, not main.
+    t0 = time.perf_counter()
+    with fs.transaction(
+        message="ingest Feb partition", branch=INGEST_BRANCH, create=True
+    ):
+        fs.put_file(str(new_local), new_repo_path)
+    timer.record("write (isolated branch commit)", time.perf_counter() - t0)
+    assert fs.ref == "main"  # the block restored us to the original branch
+
+    # --- AUDIT: main is untouched; the branch has the new partition; and the
+    # new data reads back correctly when we target the branch ref explicitly.
+    assert sorted(fs.ls(DATA_DIR, detail=False)) == sorted(
+        f"{DATA_DIR}/part-{i:03d}.parquet" for i in range(WAP_BASE_FILES)
+    )
+    on_branch = fs.ls(DATA_DIR, detail=False, ref=INGEST_BRANCH)
+    assert len(on_branch) == WAP_BASE_FILES + 1
+    assert new_repo_path in on_branch
+
+    audited = pl.read_parquet(fs.open(new_repo_path, ref=INGEST_BRANCH))
+    assert audited.height == new_df.height
+    assert audited["amount"].sum() == pytest.approx(new_df["amount"].sum(), rel=1e-6)
+
+    # --- PUBLISH: merge the branch into main as one revision.
+    t0 = time.perf_counter()
+    fs.merge(INGEST_BRANCH)
+    timer.record("publish (merge -> main)", time.perf_counter() - t0)
+
+    # main now serves the full dataset; verify the published aggregate via DuckDB.
+    published = fs.ls(DATA_DIR, detail=False)
+    assert len(published) == WAP_BASE_FILES + 1
+
+    expected = pl.concat([warehouse["base_df"], new_df])
+    con = duckdb.connect()
+    con.register_filesystem(fs)
+    n_rows, total_amount = con.sql(
+        f"SELECT count(*), sum(amount) FROM read_parquet('lore://{DATA_DIR}/*.parquet')"
+    ).fetchone()
+    assert n_rows == expected.height
+    assert total_amount == pytest.approx(expected["amount"].sum(), rel=1e-6)
+
+    timer.report()
