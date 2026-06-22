@@ -18,6 +18,12 @@ dist/
 # Built docs
 site/
 
+# Coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
 # Misc
 .claude/
 .DS_Store
