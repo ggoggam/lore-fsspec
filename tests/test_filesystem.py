@@ -18,7 +18,11 @@ pytestmark = pytest.mark.integration
 @pytest.fixture
 def fs(fixture_repo):
     # cachable=True would memoize instances across tests; force a fresh one.
-    return LoreFileSystem(path=fixture_repo["root"], skip_instance_cache=True)
+    # writable=True so the write/transaction tests can mutate; reads are
+    # unaffected. The read-only guardrail is covered separately below.
+    return LoreFileSystem(
+        path=fixture_repo["root"], writable=True, skip_instance_cache=True
+    )
 
 
 def _revision_count(fs) -> int:
@@ -230,6 +234,69 @@ def test_url_roundtrip(fixture_repo):
     url = f"lore://{fixture_repo['root']}:main@hello.txt"
     with fsspec.open(url) as f:
         assert f.read() == fixture_repo["files"]["hello.txt"]
+
+
+def test_writes_require_writable_flag(fixture_repo):
+    """A default (read-only) filesystem rejects writes with a clear error."""
+    ro = LoreFileSystem(path=fixture_repo["root"], skip_instance_cache=True)
+    with pytest.raises(PermissionError):
+        with ro.transaction(message="nope"):
+            ro.pipe_file("blocked.txt", b"x")
+
+
+def test_writes_require_open_transaction(fs):
+    """Even a writable filesystem rejects a write outside a transaction."""
+    with pytest.raises(ValueError):
+        fs.pipe_file("loose.txt", b"x")
+
+
+def test_open_wb_writes_in_transaction(fs):
+    before = _revision_count(fs)
+    with fs.transaction(message="open wb"):
+        with fs.open("written.txt", "wb") as f:
+            f.write(b"hello via open\n")
+    assert fs.cat("written.txt") == b"hello via open\n"
+    assert _revision_count(fs) == before + 1
+
+
+def test_put_file_stages_local_file(fs, tmp_path):
+    src = tmp_path / "local.bin"
+    src.write_bytes(b"payload-from-disk")
+    with fs.transaction(message="put"):
+        fs.put_file(str(src), "uploaded.bin")
+    assert fs.cat("uploaded.bin") == b"payload-from-disk"
+
+
+def test_rm_removes_from_tree(fs):
+    before = _revision_count(fs)
+    assert fs.exists("hello.txt")
+    with fs.transaction(message="rm hello"):
+        fs.rm("hello.txt")
+    assert not fs.exists("hello.txt")
+    assert _revision_count(fs) == before + 1
+
+
+def test_mv_renames_in_tree(fs, fixture_repo):
+    orig = fixture_repo["files"]["hello.txt"]
+    with fs.transaction(message="mv hello"):
+        fs.mv("hello.txt", "renamed.txt")
+    assert not fs.exists("hello.txt")
+    assert fs.cat("renamed.txt") == orig
+
+
+def test_rollback_restores_tracked_and_purges_new(fs, fixture_repo):
+    """Aborting a transaction restores edited tracked files and drops new ones."""
+    orig = fixture_repo["files"]["hello.txt"]
+    before = _revision_count(fs)
+    with pytest.raises(RuntimeError):
+        with fs.transaction(message="should roll back"):
+            fs.pipe_file("hello.txt", b"clobbered\n")  # edit a tracked file
+            fs.pipe_file("brand_new.txt", b"new\n")  # add a new file
+            raise RuntimeError("boom")
+    # tracked file restored to its committed content; new file purged.
+    assert fs.cat("hello.txt") == orig
+    assert not fs.exists("brand_new.txt")
+    assert _revision_count(fs) == before
 
 
 def test_transaction_commit_roundtrip(fs):

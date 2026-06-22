@@ -20,6 +20,7 @@ Path model (validated against a live server):
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 
 import fsspec.asyn
@@ -32,6 +33,7 @@ from lore.types.args import (
     LoreBranchListArgs,
     LoreBranchPushArgs,
     LoreFileInfoArgs,
+    LoreFileResetArgs,
     LoreFileStageArgs,
     LoreFileUnstageArgs,
     LoreGlobalArgs,
@@ -77,6 +79,7 @@ class LoreFileSystem(AsyncFileSystem):
         ref: str | None = None,
         offline: bool = False,
         identity: str | None = None,
+        writable: bool = False,
         asynchronous: bool = False,
         loop=None,
         **kwargs,
@@ -85,6 +88,10 @@ class LoreFileSystem(AsyncFileSystem):
         self._lore = lore.Lore()
         self.identity = identity
         self.offline = offline
+        # Read-only by default (like GitFileSystem). Writes additionally require
+        # an open transaction — see ``_require_write`` — so every mutation lands
+        # as one atomic Lore revision.
+        self.writable = writable
         # Lazily-resolved content-store state (see ``_storage_get``). The locks
         # guard the lazy one-time init so a concurrent read fan-out (``_cat`` /
         # ``cat_ranges``) can't open two handles / race two ``repository_info``
@@ -414,12 +421,15 @@ class LoreFileSystem(AsyncFileSystem):
         ref=None,
         **kwargs,
     ):
-        if mode != "rb":
-            raise NotImplementedError(
-                "writes go through fs.transaction(...) + pipe_file, not open(mode='wb')"
-            )
-        data = self.cat_file(path, ref=ref)
-        return MemoryFile(self, path, data)
+        if mode == "rb":
+            data = self.cat_file(path, ref=ref)
+            return MemoryFile(self, path, data)
+        if mode in ("wb", "xb"):
+            self._require_write()
+            if mode == "xb" and self.exists(path):
+                raise FileExistsError(path)
+            return LoreBufferedWriter(self, path)
+        raise NotImplementedError(f"unsupported mode {mode!r}; use 'rb' or 'wb'")
 
     async def open_async(self, path, mode="rb", ref=None, **kwargs):
         """Async streaming reads — the large-asset path for Lore.
@@ -440,6 +450,30 @@ class LoreFileSystem(AsyncFileSystem):
         return LoreAsyncStreamedFile(self, path, info["size"], ref)
 
     # ----------------------------------------------------------------- writes
+    def _require_write(self) -> None:
+        """Guard every mutation: read-only unless ``writable`` + an open txn.
+
+        Lore's write model is *stage → commit a revision*; a stage with no commit
+        leaves the working copy in a half-applied state. We therefore require an
+        open :class:`LoreTransaction` so the batch always lands as exactly one
+        atomic revision (see ``LoreTransaction.complete``).
+        """
+        if not self.writable:
+            raise PermissionError(
+                "LoreFileSystem is read-only; construct it with writable=True to "
+                "enable writes"
+            )
+        if not getattr(self, "_intrans", False):
+            raise ValueError(
+                "writes must occur inside a transaction so they commit as one "
+                "atomic revision; use `with fs.transaction(message=...): ...`"
+            )
+
+    def _stage(self, abspath: str) -> None:
+        """Record an absolute path as touched by the current transaction."""
+        if getattr(self, "_intrans", False) and self._transaction is not None:
+            self._transaction._staged.append(abspath)
+
     async def _pipe_file(self, path, value, **kwargs):
         """Author bytes into the working copy and stage them.
 
@@ -447,6 +481,7 @@ class LoreFileSystem(AsyncFileSystem):
         for materializing store content, not authoring); we then ``file_stage``
         the absolute path. The commit happens on transaction exit.
         """
+        self._require_write()
         inner = self._strip_protocol(path)
         abspath = self._abs(inner)
         parent = os.path.dirname(abspath)
@@ -457,14 +492,61 @@ class LoreFileSystem(AsyncFileSystem):
         await self._run(
             self._lore.file_stage, LoreFileStageArgs(paths=[abspath], scan=True)
         )
-        if getattr(self, "_intrans", False) and self._transaction is not None:
-            self._transaction._staged.append(abspath)
+        self._stage(abspath)
         return None
 
-    def transaction(self, message: str | None = None, metadata: dict | None = None):
-        """Enter a write transaction that commits one Lore revision on exit."""
-        self._transaction = LoreTransaction(self, message=message, metadata=metadata)
-        return self._transaction
+    async def _put_file(self, lpath, rpath, mode="overwrite", **kwargs):
+        """Copy a local file into the working copy and stage it."""
+        with open(lpath, "rb") as f:
+            data = f.read()
+        await self._pipe_file(rpath, data)
+        return None
+
+    async def _rm_file(self, path, **kwargs):
+        """Remove a file from the tree: delete on disk, then stage the deletion.
+
+        Mirrors the working-copy model used everywhere else here — Lore's
+        ``file_stage(scan=True)`` over the (now-absent) path records a deletion
+        that the transaction's commit folds into the revision. (``file_obliterate``
+        is a destructive store-level purge, not a tracked tree removal, so it is
+        intentionally not used.)
+        """
+        self._require_write()
+        inner = self._strip_protocol(path)
+        abspath = self._abs(inner)
+        if os.path.isfile(abspath):
+            os.remove(abspath)
+        await self._run(
+            self._lore.file_stage, LoreFileStageArgs(paths=[abspath], scan=True)
+        )
+        self._stage(abspath)
+        return None
+
+    def mv(self, path1, path2, recursive=False, maxdepth=None, **kwargs):
+        """Rename within the working copy, staged as part of the open transaction.
+
+        Done as an on-disk ``os.rename`` plus a ``file_stage(scan=True)`` of both
+        the old and new paths (so the scan records the removal and the addition),
+        consistent with how ``_pipe_file``/``_rm_file`` work. Lore's
+        ``file_dirty_move`` was rejected: it errors on repo-relative paths and
+        silently no-ops on absolute ones.
+        """
+        fsspec.asyn.sync(self.loop, self._mv_async, path1, path2)
+
+    async def _mv_async(self, path1, path2):
+        self._require_write()
+        src = self._abs(self._strip_protocol(path1))
+        dst = self._abs(self._strip_protocol(path2))
+        parent = os.path.dirname(dst)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        os.rename(src, dst)
+        await self._run(
+            self._lore.file_stage, LoreFileStageArgs(paths=[src, dst], scan=True)
+        )
+        self._stage(src)
+        self._stage(dst)
+        return None
 
     def _commit_revision(self, message, metadata=None):
         fsspec.asyn.sync(self.loop, self._commit_revision_async, message, metadata)
@@ -478,10 +560,21 @@ class LoreFileSystem(AsyncFileSystem):
 
     def _reset_paths(self, paths):
         if paths:
-            fsspec.asyn.sync(self.loop, self._unstage_async, paths)
+            fsspec.asyn.sync(self.loop, self._reset_async, paths)
 
-    async def _unstage_async(self, paths):
+    async def _reset_async(self, paths):
+        """Exact rollback of staged paths (transaction abort).
+
+        ``file_reset`` errors on a *staged* node, so first ``file_unstage`` to
+        drop the staging entries, then ``file_reset(purge=True)``: tracked files
+        are restored to their committed content and newly-added files (absent
+        from the revision) are purged from disk. Validated against the live
+        server for both cases, including a mixed batch.
+        """
         await self._run(self._lore.file_unstage, LoreFileUnstageArgs(paths=paths))
+        await self._run(
+            self._lore.file_reset, LoreFileResetArgs(paths=paths, purge=True)
+        )
 
     # --------------------------------------------------------------- fetch
     def fetch(self, ref: str | None = None) -> list[int]:
@@ -551,6 +644,33 @@ class LoreAsyncStreamedFile(AbstractAsyncStreamedFile):
 
     async def _fetch_range(self, start, end):
         return await self.fs._cat_file(self.path, start=start, end=end, ref=self._ref)
+
+
+class LoreBufferedWriter(io.BytesIO):
+    """Write-mode file object: buffer in memory, ``pipe_file`` on close.
+
+    Lore authors content as ordinary file I/O followed by a stage, so a write
+    is naturally whole-buffer: we accumulate the bytes and, on ``close``, hand
+    them to ``fs.pipe_file`` (which stages them into the open transaction).
+    """
+
+    def __init__(self, fs, path):
+        super().__init__()
+        self._fs = fs
+        self._path = path
+        self._committed = False
+
+    def close(self):
+        if not self._committed and not self.closed:
+            self._committed = True
+            self._fs.pipe_file(self._path, self.getvalue())
+        super().close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 def _is_lore_clone(path: str) -> bool:
