@@ -30,6 +30,7 @@ import datetime
 import io
 from pathlib import Path
 
+import anyio
 import fsspec.asyn
 import lore
 from fsspec.asyn import AbstractAsyncStreamedFile, AsyncFileSystem
@@ -321,13 +322,13 @@ class LoreFileSystem(AsyncFileSystem):
             raise IsADirectoryError(path)
         abspath = self._abs(inner)
 
-        on_disk = Path(abspath).is_file()
+        on_disk = await anyio.Path(abspath).is_file()
         if (
             await self._resolve_rev(ref) == ""
             and on_disk
             and info.get("local_size") == info.get("size")
         ):
-            return Path(abspath).read_bytes()[start:end]
+            return (await anyio.Path(abspath).read_bytes())[start:end]
 
         hash_b = bytes.fromhex(info["hash"])
         if not any(hash_b):  # default/zero hash == empty content
@@ -336,7 +337,7 @@ class LoreFileSystem(AsyncFileSystem):
             data = await self._storage_get(hash_b, bytes.fromhex(info["context"]))
         except FileNotFoundError:
             if on_disk:
-                return Path(abspath).read_bytes()[start:end]
+                return (await anyio.Path(abspath).read_bytes())[start:end]
             if self.offline:
                 msg = (
                     f"{path!r}: content fragment is not resident locally and "
@@ -558,10 +559,10 @@ class LoreFileSystem(AsyncFileSystem):
         self._require_write()
         inner = self._strip_protocol(path)
         abspath = self._abs(inner)
-        parent = Path(abspath).parent
+        parent = anyio.Path(abspath).parent
         if parent.name:
-            parent.mkdir(parents=True, exist_ok=True)
-        Path(abspath).write_bytes(value)
+            await parent.mkdir(parents=True, exist_ok=True)
+        await anyio.Path(abspath).write_bytes(value)
         await self._run(
             self._lore.file_stage,
             LoreFileStageArgs(paths=[abspath], scan=True),
@@ -576,7 +577,7 @@ class LoreFileSystem(AsyncFileSystem):
         **_kwargs: object,
     ) -> None:
         """Copy a local file into the working copy and stage it."""
-        data = Path(lpath).read_bytes()
+        data = await anyio.Path(lpath).read_bytes()
         await self._pipe_file(rpath, data)
 
     async def _rm_file(self, path: str, **_kwargs: object) -> None:
@@ -591,8 +592,8 @@ class LoreFileSystem(AsyncFileSystem):
         self._require_write()
         inner = self._strip_protocol(path)
         abspath = self._abs(inner)
-        if Path(abspath).is_file():
-            Path(abspath).unlink()
+        if await anyio.Path(abspath).is_file():
+            await anyio.Path(abspath).unlink()
         await self._run(
             self._lore.file_stage,
             LoreFileStageArgs(paths=[abspath], scan=True),
@@ -621,10 +622,10 @@ class LoreFileSystem(AsyncFileSystem):
         self._require_write()
         src = self._abs(self._strip_protocol(path1))
         dst = self._abs(self._strip_protocol(path2))
-        parent = Path(dst).parent
+        parent = anyio.Path(dst).parent
         if parent.name:
-            parent.mkdir(parents=True, exist_ok=True)
-        Path(src).rename(dst)
+            await parent.mkdir(parents=True, exist_ok=True)
+        await anyio.Path(src).rename(dst)
         await self._run(
             self._lore.file_stage,
             LoreFileStageArgs(paths=[src, dst], scan=True),
