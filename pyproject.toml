@@ -27,6 +27,7 @@ bench = [
 ]
 dev = [
     "pytest>=9.1.1",
+    "pytest-cov>=6.0.0",
     "pytest-xdist>=3.8.0",
     "testcontainers>=4.14.2",
 ]
@@ -39,3 +40,14 @@ testpaths = ["tests"]
 markers = [
     "integration: requires a reachable Lore server (LORE_TEST_REPOSITORY_URL)",
 ]
+
+[tool.coverage.run]
+source = ["lore_fsspec"]
+branch = true
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 85
