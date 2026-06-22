@@ -43,3 +43,11 @@ run = "uv run --dev pytest -m 'not integration'"
 [tasks."pre-commit"]
 description = "Run pre-commit checks via prek"
 run = "prek run --show-diff-on-failure --color=always --all-files --hook-stage=manual"
+
+[tasks.docs]
+description = "Serve API docs locally with live reload (pdoc)"
+run = "uv run --group docs pdoc lore_fsspec --docformat google"
+
+[tasks."docs:build"]
+description = "Build static API docs into site/ (pdoc)"
+run = "uv run --group docs pdoc lore_fsspec --docformat google --output-directory site"
