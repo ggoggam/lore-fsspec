@@ -21,10 +21,29 @@ class LoreTransaction(Transaction):
         super().__init__(fs, **kwargs)
         self.message = message
         self.metadata = metadata or {}
+        self._staged: list[str] = []
+
+    def __call__(
+        self, message: str | None = None, metadata: dict | None = None
+    ) -> LoreTransaction:
+        """Configure the commit message/metadata, then return self.
+
+        fsspec exposes ``fs.transaction`` as a *property* that lazily builds this
+        object (so internals like ``open(..., 'wb')`` can reach ``.files``). To
+        also support the documented ``with fs.transaction(message=...):`` form we
+        make the transaction callable: it records the message/metadata and hands
+        back ``self`` as the context manager.
+        """
+        if message is not None:
+            self.message = message
+        if metadata is not None:
+            self.metadata = metadata
+        return self
 
     def start(self):
+        super().start()  # resets self.files (deque) for a fresh transaction
         self.fs._intrans = True
-        self._staged: list[str] = []
+        self._staged = []
 
     def complete(self, commit: bool = True):
         try:

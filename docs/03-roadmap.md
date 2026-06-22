@@ -133,17 +133,43 @@ a local `loreserver`. Phase 1 shipped a disk-materialized `_cat_file`; the in-st
       checkout). `offline=True` reads of non-resident content remain a clear
       `FileNotFoundError` (verified).
 
-## Phase 3 — Write support via `LoreTransaction` (opt-in)
-- [ ] `LoreTransaction(Transaction)` with `start`/`complete(commit)`.
-- [ ] `transaction_type = LoreTransaction`; `fs.transaction(message=, metadata=)`.
-- [ ] Writable `_open("wb")` / `_pipe_file` / `_put_file` → `file_write` +
-      `file_stage` (autocommit=False inside a txn; records staged paths).
-- [ ] `complete(commit=True)` → single `revision_commit`; `commit=False` →
-      `file_unstage`/`file_reset` of staged paths. Drive coros via `fsspec.asyn.sync`.
-- [ ] `rm`/`mv` mapped to Lore file ops (`file_obliterate`/`file_dirty_move`) where
-      meaningful, inside the same transaction semantics.
-- [ ] Guardrails: default read-only; writes require `writable=True` + an open txn.
-- [ ] Tests: multi-file commit = one revision; exception path leaves no revision.
+## Phase 3 — Write support via `LoreTransaction` (opt-in) ✅
+- [x] `LoreTransaction(Transaction)` with `start`/`complete(commit)`, recording the
+      paths staged in the transaction (`_staged`).
+- [x] `transaction_type = LoreTransaction`; `with fs.transaction(message=, metadata=)`.
+      **Finding:** fsspec exposes `fs.transaction` as a *property* (lazily builds the
+      `Transaction` so `open(..., "wb")` can reach `.files`), so we could not also
+      define `transaction` as a method without shadowing it and breaking
+      `open("wb")` (`self.transaction.files` → `AttributeError`). Resolved by making
+      `LoreTransaction` **callable**: the property returns it, then `(message=…)`
+      records the message/metadata and returns `self` as the context manager.
+- [x] Writable `_open("wb")` (→ `LoreBufferedWriter`, an in-memory buffer that
+      `pipe_file`s its bytes on close) / `_pipe_file` / `_put_file`. **Authoring is
+      ordinary file I/O into the working copy + `file_stage(scan=True)`** — Lore's
+      `file_write` is for *materializing store content to disk*, not authoring (its
+      args are `address`/`path`/`output`), so it is not used for writes.
+- [x] `complete(commit=True)` → single `revision_commit` (+ `branch_push` unless
+      `offline`); `commit=False` → **exact rollback**: `file_unstage` then
+      `file_reset(purge=True)` over the staged paths. **Finding:** `file_reset`
+      errors on a *staged* node ("Failed to reset staged node"), so you must
+      `file_unstage` first; then `file_reset(purge=True)` restores edited tracked
+      files to committed content **and** purges newly-added files. Validated for
+      tracked-only, new-only, and mixed batches. Drives coros via `fsspec.asyn.sync`.
+- [x] `rm`/`mv` mapped to working-copy ops + `file_stage(scan=True)`: `_rm_file` =
+      `os.remove` + stage (a staged deletion); `mv` = `os.rename` + stage of both
+      old & new paths. **Finding:** the seemingly-matching Lore ops were rejected —
+      `file_obliterate` is a destructive store-level purge (not a tracked tree
+      removal), and `file_dirty_move` errors on repo-relative paths and silently
+      no-ops on absolute ones. The disk-op + scan approach is consistent with how
+      `_pipe_file` already authors content, and commits removals/renames as part of
+      the same revision.
+- [x] Guardrails: default read-only (`writable=False`, like `GitFileSystem`); every
+      mutation goes through `_require_write()`, which raises `PermissionError`
+      unless `writable=True` and `ValueError` unless a transaction is open (so writes
+      always land as exactly one atomic revision).
+- [x] Tests (against the live server): multi-file commit = one revision; exception
+      path leaves no revision and restores tracked / purges new files; `open("wb")`,
+      `put_file`, `rm`, `mv`; read-only and no-transaction guardrails. 47 pass.
 
 ## Phase 4 — Packaging & docs
 - [ ] README quickstart + usage examples.

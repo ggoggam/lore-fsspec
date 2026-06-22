@@ -79,6 +79,7 @@ Implications:
 | `ref` | default revision/branch for operations | current branch (`is_current`) |
 | `offline` | pass `offline=True` in `LoreGlobalArgs` (local store only, no lazy fetch) | `False` |
 | `identity` | Lore identity for `LoreGlobalArgs.identity` | none |
+| `writable` | allow writes; every mutation also requires an open transaction (read-only otherwise, like `GitFileSystem`) | `False` |
 
 The constructor builds a reusable base `LoreGlobalArgs` (repository_path, identity,
 offline) and a single `lore.Lore()` instance held as `self._lore`. The default
@@ -290,8 +291,13 @@ once per filesystem (cached) and reused across reads, then `storage_close`d on
 teardown.
 
 ### File objects: `_open` and `open_async`
-- **Sync** `_open(path, "rb", ...)`: return a `MemoryFile` around the bytes from a
-  blocking `cat_file` (mirrors `GitFileSystem`'s `MemoryFile` blob reads).
+- **Sync read** `_open(path, "rb", ...)`: return a `MemoryFile` around the bytes
+  from a blocking `cat_file` (mirrors `GitFileSystem`'s `MemoryFile` blob reads).
+- **Sync write** `_open(path, "wb"/"xb", ...)`: return a `LoreBufferedWriter` (an
+  in-memory buffer) that, on close, hands its bytes to `pipe_file` — authoring them
+  into the working copy and staging them into the open transaction. Requires
+  `writable=True` and an open transaction (see guardrails). `"xb"` raises
+  `FileExistsError` if the path already exists.
 - **Async** `open_async(path, "rb")`: return an `AbstractAsyncStreamedFile` whose
   `_fetch_range(start, end)` maps to `storage_get` with a bounded byte range, so
   large assets stream without buffering the whole file.
@@ -304,7 +310,10 @@ Return `info(...)["hash"]` (Lore content address) — stable cache key, exactly 
 Writes are not auto-committed per file. They go through `LoreTransaction` (next
 section), which batches staging and finalizes with a single atomic
 `revision_commit`. Default posture is read-only; writing requires entering a
-transaction (and a `writable=True` filesystem).
+transaction (and a `writable=True` filesystem). The write surface:
+`pipe_file`/`_open("wb")`/`put_file` (author + stage), `rm` (delete + stage a
+removal), and `mv` (rename + stage). `mv` is a sync override (fsspec has no async
+`_mv` hook) driven through `fsspec.asyn.sync`.
 
 ## `LoreTransaction`
 
@@ -320,32 +329,38 @@ class LoreTransaction(Transaction):
         super().__init__(fs, **kwargs)
         self.message = message
         self.metadata = metadata or {}
+        self._staged = []
+
+    def __call__(self, message=None, metadata=None):
+        # fsspec hands us back via the `transaction` *property*; the callable form
+        # lets `with fs.transaction(message=...):` record the message and return self.
+        if message is not None:
+            self.message = message
+        if metadata is not None:
+            self.metadata = metadata
+        return self
 
     def start(self):
+        super().start()            # resets self.files (deque) for a fresh txn
         self.fs._intrans = True
         self._staged = []          # paths staged in this txn
 
     def complete(self, commit=True):
-        # files written during the txn have already been staged on .commit()
+        # files written during the txn have already been staged on write.
         if commit:
             self.fs._commit_revision(self.message, self.metadata)   # revision_commit
         else:
-            self.fs._reset_paths(self._staged)                      # file_unstage/reset
+            self.fs._reset_paths(self._staged)             # unstage + reset(purge)
         self.fs._intrans = False
         self._staged = []
 ```
 
-Wiring:
-
-```python
-class LoreFileSystem(AsyncFileSystem):
-    transaction_type = LoreTransaction
-
-    def transaction(self, message=None, metadata=None):
-        """Enter a write transaction that commits one Lore revision on exit."""
-        self._transaction = LoreTransaction(self, message=message, metadata=metadata)
-        return self._transaction
-```
+Wiring: `transaction_type = LoreTransaction`. We do **not** override `transaction`
+as a method — fsspec exposes it as a *property* that lazily builds the
+`Transaction` (so `open(..., "wb")` can append to `self.transaction.files`).
+Shadowing it with a method broke that path (`self.transaction.files` →
+`AttributeError`). Instead the property returns our `LoreTransaction`, which is
+**callable** so the documented `fs.transaction(message=…)` form still works.
 
 Usage:
 
@@ -367,7 +382,15 @@ Mechanics (validated against the local server):
 - `complete(commit=True)` issues exactly one `revision_commit(message=…)` → one
   revision regardless of file count, then `branch_push()` to the server (both
   succeeded in the spike). `commit=False` (exception in the `with`) reverts via
-  `file_unstage`/`file_reset`.
+  **`file_unstage` then `file_reset(purge=True)`** over the staged paths.
+  *Validated:* `file_reset` errors on a *staged* node, so unstage first; then
+  `reset(purge=True)` restores edited tracked files to committed content and purges
+  newly-added files (confirmed for tracked-only, new-only, and mixed batches).
+- **`rm`/`mv`** are working-copy ops + `file_stage(scan=True)`, not the
+  similarly-named Lore commands: `file_obliterate` is a destructive store-level
+  purge, and `file_dirty_move` errors on relative paths / no-ops on absolute ones.
+  `rm` = `os.remove` + stage (a staged deletion); `mv` = `os.rename` + stage of both
+  old & new paths. Both commit as part of the transaction's single revision.
 - **Async note:** fsspec `Transaction.complete` is synchronous; it drives the
   underlying coroutines through `fsspec.asyn.sync(self.fs.loop, ...)`, so it works
   from both sync and async callers.
@@ -375,10 +398,12 @@ Mechanics (validated against the local server):
   Author identity comes from `LoreGlobalArgs.identity` (optional on the local
   auth-disabled server).
 
-Open question (validate in Phase 3): exact binding for passing `message`/`metadata`
-into the transaction given fsspec's `transaction` property contract (may warrant a
-small `start_transaction(...)` helper), and whether `branch_push` should be
-optional (offline commits without push).
+> **Resolved (Phase 3).** The `message`/`metadata` binding under fsspec's
+> `transaction` *property* contract is handled by making `LoreTransaction`
+> callable (see Wiring above) rather than adding a `start_transaction(...)` helper.
+> `branch_push` is already gated on `offline` (offline commits skip the push).
+> `metadata` is recorded on the transaction but not yet applied via
+> `revision_metadata_set` — a small follow-up, not blocking.
 
 ## Backend wrapper (`_lore.py`)
 
