@@ -21,29 +21,53 @@ class LoreTransaction(Transaction):
         super().__init__(fs, **kwargs)
         self.message = message
         self.metadata = metadata or {}
+        self.branch: str | None = None
+        self.create = False
         self._staged: list[str] = []
+        self._prev_ref: str | None = None
 
     def __call__(
-        self, message: str | None = None, metadata: dict | None = None
+        self,
+        message: str | None = None,
+        metadata: dict | None = None,
+        branch: str | None = None,
+        create: bool = False,
     ) -> LoreTransaction:
-        """Configure the commit message/metadata, then return self.
+        """Configure the commit, then return self.
 
         fsspec exposes ``fs.transaction`` as a *property* that lazily builds this
         object (so internals like ``open(..., 'wb')`` can reach ``.files``). To
         also support the documented ``with fs.transaction(message=...):`` form we
-        make the transaction callable: it records the message/metadata and hands
-        back ``self`` as the context manager.
+        make the transaction callable: it records the settings and hands back
+        ``self`` as the context manager.
+
+        ``branch`` checks out that branch for the duration of the block, so the
+        revision lands there instead of the current branch (and the original
+        branch is restored on exit) — the isolation slice of a feature-branch
+        workflow. With ``create=True`` the branch is created first (off the
+        current tip). Merging back is left to :meth:`LoreFileSystem.merge`, since
+        a merge can conflict and must not be performed implicitly.
         """
         if message is not None:
             self.message = message
         if metadata is not None:
             self.metadata = metadata
+        if branch is not None:
+            self.branch = branch
+            self.create = create
         return self
 
     def start(self):
         super().start()  # resets self.files (deque) for a fresh transaction
         self.fs._intrans = True
         self._staged = []
+        self._prev_ref = None
+        if self.branch is not None and self.branch != self.fs.ref:
+            self._prev_ref = self.fs.ref
+            if self.create:
+                self.fs.create_branch(self.branch, checkout=True)
+            else:
+                self.fs.switch_branch(self.branch)
 
     def complete(self, commit: bool = True):
         try:
@@ -55,3 +79,10 @@ class LoreTransaction(Transaction):
         finally:
             self.fs._intrans = False
             self._staged = []
+            # Restore the branch we were on before the block, even on failure.
+            if self._prev_ref is not None:
+                self.fs.switch_branch(self._prev_ref)
+                self._prev_ref = None
+            # One-shot settings: don't leak branch targeting into the next txn.
+            self.branch = None
+            self.create = False
