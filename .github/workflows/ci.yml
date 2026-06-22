@@ -63,11 +63,32 @@ jobs:
       - name: Test
         run: mise run test
 
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v3
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: docs-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            docs-${{ runner.os }}-
+
+      - name: Build docs
+        run: mise run docs:build
+
   ci-required:
     name: ci-required
     needs:
       - pre-commit
       - test
+      - docs
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -75,9 +96,10 @@ jobs:
         env:
           PRE_COMMIT_RESULT: ${{ needs.pre-commit.result }}
           TEST_RESULT: ${{ needs.test.result }}
+          DOCS_RESULT: ${{ needs.docs.result }}
         run: |
           set -euo pipefail
-          for result in "$PRE_COMMIT_RESULT" "$TEST_RESULT"; do
+          for result in "$PRE_COMMIT_RESULT" "$TEST_RESULT" "$DOCS_RESULT"; do
             if [ "$result" != "success" ]; then
               echo "A required CI job did not pass."
               exit 1
