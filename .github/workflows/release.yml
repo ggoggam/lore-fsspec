@@ -1,11 +1,15 @@
 name: Release
 
-# Publish to PyPI when a GitHub Release is published. The build runs without any
-# privileged permissions; only the publish job is granted the OIDC token used
-# for PyPI Trusted Publishing (no API token is stored).
+# Release is git-driven: on a push to main that bumps the `version` in
+# pyproject.toml, build and publish to PyPI, then create the matching tag and
+# GitHub Release. No manual GitHub Release step is needed.
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
+    # Only bother running when the metadata that holds the version changed; the
+    # detect job is the source of truth for whether it actually bumped.
+    paths:
+      - pyproject.toml
 
 permissions:
   contents: read
@@ -15,29 +19,50 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  detect:
+    name: detect version bump
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need the parent commit to compare the version against.
+          fetch-depth: 2
+
+      - uses: jdx/mise-action@v3
+
+      - name: Detect version change
+        id: check
+        run: |
+          set -euo pipefail
+          version="$(uv version --short)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git cat-file -e HEAD~1:pyproject.toml 2>/dev/null; then
+            prev="$(git show HEAD~1:pyproject.toml \
+              | sed -n 's/^version = "\(.*\)"/\1/p' | head -n1)"
+          else
+            prev=""
+          fi
+          if [ "$version" != "$prev" ]; then
+            echo "Version changed: ${prev:-<none>} -> $version"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version unchanged ($version); skipping release."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: build
+    needs: detect
+    if: needs.detect.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       # Installs uv (pinned in mise.toml) and caches its data dir.
       - uses: jdx/mise-action@v3
-
-      # Fail fast if the release tag doesn't match the version in pyproject.toml,
-      # so we never ship a mismatched release. Accepts both "0.1.0" and "v0.1.0".
-      - name: Verify tag matches project version
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: |
-          set -euo pipefail
-          project_version="$(uv version --short)"
-          tag_version="${RELEASE_TAG#v}"
-          if [ "$tag_version" != "$project_version" ]; then
-            echo "Release tag ($RELEASE_TAG) does not match project version ($project_version)."
-            exit 1
-          fi
-          echo "Tag matches project version: $project_version"
 
       - name: Build sdist and wheel
         run: uv build
@@ -70,3 +95,29 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: github release
+    needs: [detect, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      # Create the tag and the GitHub Release.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; nothing to do."
+            exit 0
+          fi
+          gh release create "$tag" \
+            --target "$GITHUB_SHA" \
+            --title "$tag" \
+            --generate-notes
