@@ -199,6 +199,59 @@ def test_open_async_seek_and_chunked_read(
     assert mid == b"lore "
 
 
+def test_open_async_fetches_blob_once(
+    fs: LoreFileSystem,
+    fixture_repo: dict,
+) -> None:
+    """E1: chunked/seeked reads slice one buffered blob, not one fetch per range."""
+    full = fixture_repo["files"]["hello.txt"]
+    f = fsspec.asyn.sync(fs.loop, fs.open_async, "hello.txt")
+    try:
+        head = fsspec.asyn.sync(fs.loop, f.read, 6)
+        f.seek(20)
+        tail = fsspec.asyn.sync(fs.loop, f.read, 5)
+    finally:
+        fsspec.asyn.sync(fs.loop, f.close)
+    assert head == full[:6]
+    assert tail == full[20:25]
+    # The whole fragment is buffered once and reused (the store has no ranged read).
+    assert f._buf == full
+
+
+def test_get_file_downloads_working_copy(
+    fs: LoreFileSystem,
+    fixture_repo: dict,
+    tmp_path: Path,
+) -> None:
+    """C2: get_file/get were NotImplementedError; the working-copy fast path."""
+    dest = tmp_path / "out.txt"
+    fs.get_file("hello.txt", str(dest))
+    assert dest.read_bytes() == fixture_repo["files"]["hello.txt"]
+
+
+def test_get_file_downloads_from_store(
+    fs: LoreFileSystem,
+    fixture_repo: dict,
+    tmp_path: Path,
+) -> None:
+    """C2: get_file streams straight to disk from the content store (off-disk)."""
+    Path(fixture_repo["root"], "hello.txt").unlink()  # force the store path
+    dest = tmp_path / "out.txt"
+    fs.get_file("hello.txt", str(dest))
+    assert dest.read_bytes() == fixture_repo["files"]["hello.txt"]
+
+
+def test_get_via_sync_wrapper(
+    fs: LoreFileSystem,
+    fixture_repo: dict,
+    tmp_path: Path,
+) -> None:
+    """C2: the public ``fs.get`` (not just _get_file) routes through and works."""
+    dest = tmp_path / "got.txt"
+    fs.get("hello.txt", str(dest))
+    assert dest.read_bytes() == fixture_repo["files"]["hello.txt"]
+
+
 def test_fetch_syncs_current_ref(fs: LoreFileSystem) -> None:
     targets = fs.fetch()
     assert targets
@@ -323,6 +376,25 @@ def test_transaction_commit_roundtrip(fs: LoreFileSystem) -> None:
     assert fs.cat("b.txt") == b"beta"
     # One revision for the whole transaction, regardless of file count.
     assert _revision_count(fs) == before + 1
+
+
+def test_transaction_start_failure_does_not_leak_intrans(fs: LoreFileSystem) -> None:
+    """C1: a failed branch switch in start() must not leave the fs in-transaction.
+
+    Entering a ``create=True`` transaction on an already-existing branch fails
+    inside ``start()`` (i.e. inside ``__enter__``), so ``__exit__`` never runs.
+    The bug left ``_intrans=True`` forever, silently letting later loose writes
+    through. After the failure the fs must be fully reset.
+    """
+    fs.create_branch("dup")
+    txn = fs.transaction(message="x", branch="dup", create=True)
+    with pytest.raises(LoreError):
+        txn.__enter__()
+    assert fs._intrans is False
+    assert fs._transaction is None
+    # The leak would let this loose (out-of-transaction) write slip through.
+    with pytest.raises(ValueError, match="transaction"):
+        fs.pipe_file("loose.txt", b"x")
 
 
 def test_transaction_rollback_does_not_commit(fs: LoreFileSystem) -> Never:

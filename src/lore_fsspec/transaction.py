@@ -74,16 +74,27 @@ class LoreTransaction(Transaction):
 
     def start(self) -> None:
         """Begin the transaction: reset staged state and switch branch if needed."""
-        super().start()  # resets self.files (deque) for a fresh transaction
-        self.fs._intrans = True
+        super().start()  # resets self.files (deque); arms fs._intrans = True
         self._staged = []
         self._prev_ref = None
         if self.branch is not None and self.branch != self.fs.ref:
-            self._prev_ref = self.fs.ref
-            if self.create:
-                self.fs.create_branch(self.branch, checkout=True)
-            else:
-                self.fs.switch_branch(self.branch)
+            # The branch switch can fail (e.g. create=True on an existing branch).
+            # We're inside __enter__ -> start(); if start() raises, __exit__ never
+            # runs, so the _intrans flag super().start() just armed would stay set
+            # forever, silently letting later writes escape the transaction. Undo
+            # it on failure. Record _prev_ref only after a successful switch so a
+            # failed start doesn't later try to "restore" a branch we never left.
+            prev = self.fs.ref
+            try:
+                if self.create:
+                    self.fs.create_branch(self.branch, checkout=True)
+                else:
+                    self.fs.switch_branch(self.branch)
+            except BaseException:
+                self.fs._intrans = False
+                self.fs._transaction = None
+                raise
+            self._prev_ref = prev
 
     def complete(self, commit: bool = True) -> None:  # noqa: FBT001, FBT002
         """Commit or roll back all staged writes as one atomic revision."""

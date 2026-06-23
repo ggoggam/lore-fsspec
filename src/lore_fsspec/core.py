@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import datetime
 import io
+import shutil
 from pathlib import Path
 
 import anyio
@@ -38,6 +39,7 @@ from fsspec.implementations.memory import MemoryFile
 from lore.types import LoreAddress
 from lore.types.args import (
     LoreBranchCreateArgs,
+    LoreBranchInfoArgs,
     LoreBranchListArgs,
     LoreBranchMergeAbortArgs,
     LoreBranchMergeStartArgs,
@@ -55,12 +57,15 @@ from lore.types.args import (
     LoreRevisionSyncArgs,
     LoreStorageCloseArgs,
     LoreStorageGetArgs,
+    LoreStorageGetFileArgs,
+    LoreStorageGetFileItem,
     LoreStorageGetItem,
     LoreStorageOpenArgs,
     LoreStorageRemoteConfig,
 )
 from lore.types.enums import LoreErrorCode
 from lore.types.events import (
+    LoreBranchInfoEventData,
     LoreBranchListEntryEventData,
     LoreBranchMergeConflictFileEventData,
     LoreFileInfoEventData,
@@ -180,6 +185,16 @@ class LoreFileSystem(AsyncFileSystem):
         inner = inner.strip("/")
         return str(Path(self.clone_root) / inner) if inner else self.clone_root
 
+    def _is_working_ref(self, ref: str | None) -> bool:
+        """True when ``ref`` denotes the checked-out working copy.
+
+        A pure predicate (no SDK call): empty or the instance's own ref both map
+        to ``""`` in :meth:`_resolve_rev`, i.e. the current working copy / branch
+        tip. Read paths use this to take the no-resolution fast path without a
+        second ref-resolution round-trip.
+        """
+        return not ref or ref == self.ref
+
     async def _resolve_rev(self, ref: str | None) -> str:
         """Translate a ref into the ``revision`` arg the ``lore`` commands want.
 
@@ -192,7 +207,7 @@ class LoreFileSystem(AsyncFileSystem):
         * a known branch name → that branch's tip revision (``latest``),
         * anything else → passed straight through (assumed a revision id/hex).
         """
-        if not ref or ref == self.ref:
+        if self._is_working_ref(ref):
             return ""
         tip = await self._branch_tip(ref)
         return tip if tip is not None else ref
@@ -200,22 +215,24 @@ class LoreFileSystem(AsyncFileSystem):
     async def _branch_tip(self, name: str) -> str | None:
         """Tip revision (hex) of branch ``name``, or ``None`` if no such branch.
 
-        ``branch_list`` can report a branch twice (local + remote tracking); we
-        prefer the ``is_current`` entry and fall back to the first name match.
+        Uses the targeted ``branch_info`` (one branch) rather than enumerating
+        every branch with ``branch_list``. A non-branch ref makes ``branch_info``
+        error/return nothing → ``None``, so the caller falls through to
+        revision-id passthrough. Prefers the local tip, falling back to the
+        remote tracking tip for a branch that exists only on the remote.
         """
-        entries = await self._run(
-            self._lore.branch_list,
-            LoreBranchListArgs(),
-            entry_type=LoreBranchListEntryEventData,
-        )
-        match = None
-        for e in entries:
-            if e.name == name:
-                if getattr(e, "is_current", False):
-                    return e.latest.hex()
-                if match is None:
-                    match = e
-        return match.latest.hex() if match is not None else None
+        try:
+            evs = await self._run(
+                self._lore.branch_info,
+                LoreBranchInfoArgs(branch=name),
+                entry_type=LoreBranchInfoEventData,
+            )
+        except LoreError:
+            return None
+        if not evs:
+            return None
+        ev = evs[0]
+        return _nonzero_hex(ev.latest) or _nonzero_hex(ev.latest_remote)
 
     @staticmethod
     def _node_info(node: LoreRepositoryStateDumpNodeEventData, name: str) -> dict:
@@ -324,7 +341,7 @@ class LoreFileSystem(AsyncFileSystem):
 
         on_disk = await anyio.Path(abspath).is_file()
         if (
-            await self._resolve_rev(ref) == ""
+            self._is_working_ref(ref)
             and on_disk
             and info.get("local_size") == info.get("size")
         ):
@@ -349,6 +366,61 @@ class LoreFileSystem(AsyncFileSystem):
                 ) from None
             raise
         return data[start:end]
+
+    async def _get_file(self, rpath: str, lpath: str, **_kwargs: object) -> None:
+        """Download one repo file to a local path (fsspec ``get``/``download``).
+
+        ``AsyncFileSystem`` has no usable default here (the base ``_get_file`` is
+        ``NotImplementedError``), so without this every ``fs.get``/``download``/
+        ``cp`` raises. We mirror ``_cat_file``'s path selection but stream to disk
+        via the SDK-native ``storage_get_file`` instead of buffering the blob:
+
+        * a directory ``rpath`` just creates ``lpath`` (like the base get_file);
+        * the working-copy fast path copies the materialized file off the clone;
+        * otherwise the content fragment is written straight to ``lpath``, with
+          the same offline / disk-fallback handling as ``_cat_file``.
+
+        ``get_file`` always reads the checked-out ref, so there is no ``ref`` arg.
+        """
+        inner = self._strip_protocol(rpath)
+        info = await self._info(rpath)
+        dest = anyio.Path(lpath)
+        if info["type"] != "file":
+            await dest.mkdir(parents=True, exist_ok=True)
+            return
+        if dest.parent.name:
+            await dest.parent.mkdir(parents=True, exist_ok=True)
+
+        abspath = self._abs(inner)
+        on_disk = await anyio.Path(abspath).is_file()
+        if on_disk and info.get("local_size") == info.get("size"):
+            await anyio.to_thread.run_sync(shutil.copyfile, abspath, lpath)
+            return
+
+        hash_b = bytes.fromhex(info["hash"])
+        if not any(hash_b):  # default/zero hash == empty content
+            await dest.write_bytes(b"")
+            return
+        try:
+            await self._storage_get_file(
+                hash_b,
+                bytes.fromhex(info["context"]),
+                lpath,
+            )
+        except FileNotFoundError:
+            if on_disk:
+                await anyio.to_thread.run_sync(shutil.copyfile, abspath, lpath)
+                return
+            if self.offline:
+                msg = (
+                    f"{rpath!r}: content fragment is not resident locally and "
+                    f"offline=True; run fs.fetch(...) or construct the filesystem "
+                    f"with offline=False to allow lazy fetching"
+                )
+                raise FileNotFoundError(
+                    msg,
+                ) from None
+            raise
 
     # ----------------------------------------------------------- content store
     async def _repo_info(self) -> LoreRepositoryDataEventData:
@@ -438,6 +510,49 @@ class LoreFileSystem(AsyncFileSystem):
                 buf[ev.offset : ev.offset + len(ev.bytes)] = ev.bytes
         return bytes(buf)
 
+    async def _storage_get_file(
+        self,
+        hash_b: bytes,
+        context_b: bytes,
+        dest_path: str,
+    ) -> None:
+        """Write one content-addressed fragment **straight to** ``dest_path``.
+
+        The SDK-native download primitive: unlike ``_storage_get`` it emits no
+        DATA events and never builds an in-memory blob — the payload is streamed
+        to disk by the library. Raises ``FileNotFoundError`` when the address is
+        not resident (mirrors ``_storage_get``). The library leaves partial
+        output behind on failure ("cleanup is the caller's responsibility"), so
+        we remove ``dest_path`` before re-raising.
+        """
+        handle = await self._storage()
+        partition = (await self._repo_info()).id
+        item = LoreStorageGetFileItem(
+            id=1,
+            partition=partition,
+            address=LoreAddress(hash=hash_b, context=context_b),
+            path=dest_path,
+            local_cache=not self.offline,
+        )
+        # check=False: inspect the per-item completion ourselves (same event as
+        # storage_get) so "not found" maps to FileNotFoundError, not LoreError.
+        events = await _lore.run(
+            self._lore.storage_get_file,
+            self._gargs(),
+            LoreStorageGetFileArgs(handle=handle, items=[item]),
+            check=False,
+        )
+        for ev in events:
+            if isinstance(ev, LoreStorageGetItemCompleteEventData):
+                code = LoreErrorCode(int(ev.error_code))
+                if code == LoreErrorCode.NONE:
+                    continue
+                with contextlib.suppress(OSError):
+                    await anyio.Path(dest_path).unlink()
+                if code == LoreErrorCode.ADDRESS_NOT_FOUND:
+                    raise FileNotFoundError(hash_b.hex())
+                raise LoreError(code, "storage_get_file failed")
+
     def ukey(self, path: str) -> str:
         """Stable cache key = the Lore content address (mirrors GitFileSystem)."""
         return self.info(path)["hash"]
@@ -489,12 +604,16 @@ class LoreFileSystem(AsyncFileSystem):
         ref: str | None = None,
         **_kwargs: object,
     ) -> LoreAsyncStreamedFile:
-        """Async streaming reads — the large-asset path for Lore.
+        """Async file object for reads — the ``seek``/``read``-in-chunks path.
 
-        Returns an :class:`AbstractAsyncStreamedFile` whose ``_fetch_range`` maps
-        to ``_cat_file`` byte ranges, so a consumer can ``seek``/``read`` chunks
-        of a multi-GB asset without buffering the whole blob (as ``_open`` /
-        ``MemoryFile`` does). Read-only, mirroring ``_open``.
+        Returns an :class:`AbstractAsyncStreamedFile` so a consumer can
+        ``seek``/``read`` a file incrementally. Read-only, mirroring ``_open``.
+
+        Note: the Lore content store has **no ranged read** (``LoreStorageGetItem``
+        carries no offset/length), so a fragment can only be fetched whole. The
+        returned file therefore fetches the blob **once** on first access and
+        serves all subsequent ranges from that in-memory buffer (see
+        :class:`LoreAsyncStreamedFile`) — it is not bounded-memory streaming.
         """
         if mode != "rb":
             msg = (
@@ -813,11 +932,16 @@ class LoreFileSystem(AsyncFileSystem):
 
 
 class LoreAsyncStreamedFile(AbstractAsyncStreamedFile):
-    """Read-only async file streaming bytes from Lore's content store.
+    """Read-only async file backed by Lore's content store.
 
     ``size`` is passed in so the base class never does a sync ``info`` lookup on
-    the loop thread; ``cache_type="none"`` keeps it a true stream (each ``read``
-    pulls exactly its range via ``_fetch_range`` → ``_cat_file``).
+    the loop thread. The store has no ranged read, so we cannot pull "exactly
+    this range" — fetching any byte range would re-materialize the *whole*
+    fragment. So we fetch the blob **once** (lazily, on first ``read``) and slice
+    every subsequent range from that buffer; ``cache_type="none"`` then just
+    routes each ``read`` through our buffer. This is one network fetch per file,
+    not one per chunk — true bounded-memory streaming needs offset/length support
+    in the Lore SDK.
     """
 
     def __init__(
@@ -830,14 +954,14 @@ class LoreAsyncStreamedFile(AbstractAsyncStreamedFile):
         """Initialize with filesystem, path, known size, and optional ref."""
         super().__init__(fs, path, mode="rb", size=size, cache_type="none")
         self._ref = ref
+        self._buf: bytes | None = None
 
     async def _fetch_range(self, start: int, end: int) -> bytes:
-        return await self.fs._cat_file(  # noqa: SLF001
-            self.path,
-            start=start,
-            end=end,
-            ref=self._ref,
-        )
+        # ponytail: whole-blob buffer; one fetch reused for every range. Bounded
+        # streaming would need ranged reads in the Lore store (no offset today).
+        if self._buf is None:
+            self._buf = await self.fs._cat_file(self.path, ref=self._ref)  # noqa: SLF001
+        return self._buf[start:end]
 
 
 class LoreBufferedWriter(io.BytesIO):
@@ -869,6 +993,16 @@ class LoreBufferedWriter(io.BytesIO):
     def __exit__(self, *exc: object) -> None:
         """Exit context manager and flush writes."""
         self.close()
+
+
+def _nonzero_hex(h: object) -> str | None:
+    """Hex of a Lore hash/revision, or ``None`` if it is the all-zero default.
+
+    ``branch_info`` reports a zero ``latest`` for a branch with no local commits
+    (e.g. remote-only), so callers treat all-zero as "absent".
+    """
+    s = h.hex()
+    return s if s and any(c != "0" for c in s) else None
 
 
 def _is_lore_clone(path: str) -> bool:
