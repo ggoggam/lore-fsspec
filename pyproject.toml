@@ -4,11 +4,31 @@ version = "0.1.0"
 description = "fsspec filesystem for Lore (Epic Games' version control system)"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "ggoggam", email = "ohjoon0204@gmail.com" }]
+keywords = ["fsspec", "lore", "filesystem", "version-control", "epic-games"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Filesystems",
+    "Topic :: Software Development :: Version Control",
+    "Typing :: Typed",
+]
 dependencies = [
     "anyio>=4.14.0",
     "fsspec>=2026.6.0",
     "lore-vcs>=0.8.3",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ggoggam/lore-fsspec"
+Repository = "https://github.com/ggoggam/lore-fsspec"
+Issues = "https://github.com/ggoggam/lore-fsspec/issues"
 
 [project.entry-points."fsspec.specs"]
 lore = "lore_fsspec.core:LoreFileSystem"

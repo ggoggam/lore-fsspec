@@ -1,0 +1,72 @@
+name: Release
+
+# Publish to PyPI when a GitHub Release is published. The build runs without any
+# privileged permissions; only the publish job is granted the OIDC token used
+# for PyPI Trusted Publishing (no API token is stored).
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs uv (pinned in mise.toml) and caches its data dir.
+      - uses: jdx/mise-action@v3
+
+      # Fail fast if the release tag doesn't match the version in pyproject.toml,
+      # so we never ship a mismatched release. Accepts both "0.1.0" and "v0.1.0".
+      - name: Verify tag matches project version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          project_version="$(uv version --short)"
+          tag_version="${RELEASE_TAG#v}"
+          if [ "$tag_version" != "$project_version" ]; then
+            echo "Release tag ($RELEASE_TAG) does not match project version ($project_version)."
+            exit 1
+          fi
+          echo "Tag matches project version: $project_version"
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Check distribution metadata
+        run: uvx twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    # The environment scopes the Trusted Publisher on PyPI and is where you can
+    # add required reviewers / deployment protection rules for releases.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/lore-fsspec
+    permissions:
+      # Mint the short-lived OIDC token PyPI exchanges for an upload credential.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
